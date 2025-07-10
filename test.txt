@@ -1,0 +1,53 @@
+test
+def calculate_burst_entropy(df, lookback_months=6):
+    """
+    Capture entropy of filing bursts vs normal periods
+    """
+    result = (
+        df.with_columns([
+            pl.col('filing_date').dt.truncate('1mo').alias('month')
+        ])
+        .group_by(['qid', 'month'])
+        .agg([
+            pl.col('document_id').n_unique().alias('monthly_filings')
+        ])
+        .sort(['qid', 'month'])
+        .with_columns([
+            # Calculate rolling statistics
+            pl.col('monthly_filings').rolling_mean(window_size=lookback_months).over('qid').alias('avg_filings'),
+            pl.col('monthly_filings').rolling_std(window_size=lookback_months).over('qid').alias('std_filings')
+        ])
+        .with_columns([
+            # Create mutually exclusive and exhaustive categories
+            pl.when(pl.col('monthly_filings') > pl.col('avg_filings') + 2 * pl.col('std_filings'))
+            .then(pl.lit('burst'))
+            .when(pl.col('monthly_filings') < pl.col('avg_filings') - 1 * pl.col('std_filings'))
+            .then(pl.lit('low'))
+            .otherwise(pl.lit('normal'))
+            .alias('filing_regime')
+        ])
+        .group_by(['qid', 'filing_regime'])
+        .agg([
+            pl.count().alias('regime_count')
+        ])
+        .group_by('qid')
+        .agg([
+            pl.col('regime_count').sum().alias('total_months'),
+            pl.col('filing_regime').list(),
+            pl.col('regime_count').list()
+        ])
+        .with_columns([
+            # Calculate probabilities for each regime
+            (pl.col('regime_count').list.get(0) / pl.col('total_months')).alias('prob_0'),
+            (pl.col('regime_count').list.get(1) / pl.col('total_months')).alias('prob_1'), 
+            (pl.col('regime_count').list.get(2) / pl.col('total_months')).alias('prob_2')
+        ])
+        .with_columns([
+            # Calculate entropy across all three regimes
+            pl.concat_list(['prob_0', 'prob_1', 'prob_2'])
+            .map_elements(lambda x: entropy([p for p in x if p > 0]))
+            .alias('regime_entropy')
+        ])
+    )
+    
+    return result
