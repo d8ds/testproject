@@ -52,3 +52,56 @@ factor_df = (
 )
 
 print(factor_df)
+
+def process_8k_filings_lsa(df, n_components=50, max_features=5000):
+    """Complete pipeline for 8K filing alpha generation"""
+    
+    # 1. Aggregate to document level
+    doc_df = df.group_by(['qid', 'document_id', 'filing_date']).agg(
+        pl.col('sentence_text').str.concat(' ').alias('full_text')
+    )
+    
+    # 2. Create and fit LSA pipeline
+    vectorizer = TfidfVectorizer(
+        max_features=max_features,
+        stop_words='english',
+        ngram_range=(1, 2),
+        min_df=2,
+        max_df=0.95,
+        lowercase=True,
+        strip_accents='ascii'
+    )
+    
+    # 3. Vectorize text
+    X_tfidf = vectorizer.fit_transform(doc_df['full_text'])
+    
+    # 4. Apply TruncatedSVD
+    svd = TruncatedSVD(
+        n_components=n_components,
+        algorithm='randomized',
+        random_state=42
+    )
+    X_lsa = svd.fit_transform(X_tfidf)
+    
+    # 5. Add LSA features to dataframe
+    feature_cols = [f'lsa_{i}' for i in range(n_components)]
+    lsa_df = pl.DataFrame(X_lsa, schema=feature_cols)
+    doc_df = pl.concat([doc_df, lsa_df], how='horizontal')
+    
+    # 6. Aggregate to stock-date level
+    stock_df = doc_df.group_by(['qid', 'filing_date']).agg([
+        pl.col(f'lsa_{i}').mean().alias(f'lsa_{i}_mean') 
+        for i in range(n_components)
+    ] + [
+        pl.col(f'lsa_{i}').std().alias(f'lsa_{i}_std') 
+        for i in range(n_components)
+    ])
+    
+    return stock_df, svd, vectorizer
+
+# Usage
+final_df, svd_model, tfidf_model = process_8k_filings_lsa(
+    your_df, 
+    n_components=50, 
+    max_features=5000
+)
