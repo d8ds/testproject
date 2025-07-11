@@ -1,11 +1,14 @@
-def calculate_rolling_entropy_features(df, window_months=12):
+import polars as pl
+import numpy as np
+from scipy.stats import entropy
+import pandas as pd
+
+def calculate_rolling_entropy_safe(df, window_months=12):
     """
-    Calculate entropy using rolling window - fixed version
+    Calculate rolling entropy without lookahead bias using pandas for rolling operations
     """
-    from scipy.stats import entropy
-    import numpy as np
     
-    # Create monthly filing counts
+    # Step 1: Create monthly filing counts
     monthly_data = (
         df.with_columns([
             pl.col('filing_date').dt.truncate('1mo').alias('month')
@@ -17,62 +20,256 @@ def calculate_rolling_entropy_features(df, window_months=12):
         .sort(['qid', 'month'])
     )
     
-    # Calculate rolling entropy properly
-    def rolling_entropy_func(values):
-        """Calculate entropy for a rolling window"""
-        if len(values) < 3:  # Need minimum data
+    # Convert to pandas for rolling operations (Polars rolling_map has limitations)
+    monthly_pd = monthly_data.to_pandas()
+    monthly_pd['month'] = pd.to_datetime(monthly_pd['month'])
+    monthly_pd = monthly_pd.set_index('month')
+    
+    def safe_entropy(values):
+        """Calculate entropy safely"""
+        # Remove NaN values
+        values = values.dropna()
+        
+        if len(values) < 3:  # Need minimum data points
             return np.nan
+        
         if values.sum() == 0:
             return 0.0
         
         # Convert to probabilities
         probs = values / values.sum()
-        # Remove zeros to avoid log(0)
+        
+        # Remove zeros
         probs = probs[probs > 0]
         
         if len(probs) <= 1:
             return 0.0
-            
-        return float(entropy(probs))  # Ensure float return
+        
+        # Calculate entropy
+        return entropy(probs)
     
+    # Calculate rolling features
+    result_list = []
+    
+    for qid in monthly_pd['qid'].unique():
+        qid_data = monthly_pd[monthly_pd['qid'] == qid].copy()
+        
+        # Calculate rolling entropy
+        qid_data['rolling_entropy'] = (
+            qid_data['monthly_filings']
+            .rolling(window=window_months, min_periods=6)
+            .apply(safe_entropy, raw=False)
+        )
+        
+        # Calculate other rolling features
+        qid_data['rolling_mean'] = (
+            qid_data['monthly_filings']
+            .rolling(window=window_months, min_periods=6)
+            .mean()
+        )
+        
+        qid_data['rolling_std'] = (
+            qid_data['monthly_filings']
+            .rolling(window=window_months, min_periods=6)
+            .std()
+        )
+        
+        # Calculate coefficient of variation
+        qid_data['rolling_cv'] = qid_data['rolling_std'] / qid_data['rolling_mean']
+        
+        result_list.append(qid_data.reset_index())
+    
+    # Combine results
+    all_results = pd.concat(result_list, ignore_index=True)
+    
+    # Convert back to polars
+    result_pl = pl.from_pandas(all_results)
+    
+    # Join back to original data
+    final_result = df.join(
+        result_pl.select(['qid', 'month', 'rolling_entropy', 'rolling_cv', 'rolling_mean']),
+        left_on=['qid', pl.col('filing_date').dt.truncate('1mo')],
+        right_on=['qid', 'month'],
+        how='left'
+    )
+    
+    return final_result
+
+
+def calculate_entropy_features_vectorized(df, window_months=12):
+    """
+    Alternative approach using vectorized operations
+    """
+    
+    # Create monthly data
+    monthly_data = (
+        df.with_columns([
+            pl.col('filing_date').dt.truncate('1mo').alias('month')
+        ])
+        .group_by(['qid', 'month'])
+        .agg([
+            pl.col('document_id').n_unique().alias('monthly_filings')
+        ])
+        .sort(['qid', 'month'])
+    )
+    
+    # Add row numbers for each qid
+    monthly_data = monthly_data.with_columns([
+        pl.int_range(pl.len()).over('qid').alias('month_idx')
+    ])
+    
+    # Calculate rolling statistics using Polars built-in functions
     rolling_features = (
         monthly_data
         .with_columns([
-            # Calculate rolling entropy using custom function
-            pl.col('monthly_filings')
-            .rolling_map(
-                rolling_entropy_func,
-                window_size=window_months,
-                min_periods=6
-            )
-            .over('qid')
-            .alias('rolling_entropy'),
-            
-            # Rolling mean for comparison
+            # Rolling mean
             pl.col('monthly_filings')
             .rolling_mean(window_size=window_months, min_periods=6)
             .over('qid')
-            .alias('rolling_mean_filings'),
+            .alias('rolling_mean'),
             
             # Rolling std
             pl.col('monthly_filings')
             .rolling_std(window_size=window_months, min_periods=6)
             .over('qid')
-            .alias('rolling_std_filings')
+            .alias('rolling_std'),
+            
+            # Rolling max
+            pl.col('monthly_filings')
+            .rolling_max(window_size=window_months, min_periods=6)
+            .over('qid')
+            .alias('rolling_max'),
+            
+            # Rolling min
+            pl.col('monthly_filings')
+            .rolling_min(window_size=window_months, min_periods=6)
+            .over('qid')
+            .alias('rolling_min'),
         ])
         .with_columns([
-            # Calculate CV after getting mean and std
-            (pl.col('rolling_std_filings') / pl.col('rolling_mean_filings'))
-            .alias('rolling_cv')
+            # Coefficient of variation
+            (pl.col('rolling_std') / pl.col('rolling_mean')).alias('rolling_cv'),
+            
+            # Range normalized by mean
+            ((pl.col('rolling_max') - pl.col('rolling_min')) / pl.col('rolling_mean')).alias('rolling_range_norm'),
+            
+            # Simple entropy proxy: 1 / CV (lower CV = higher consistency = lower entropy)
+            (1 / (pl.col('rolling_std') / pl.col('rolling_mean') + 0.01)).alias('consistency_score'),
+            
+            # Burst indicator: current vs rolling mean
+            (pl.col('monthly_filings') / pl.col('rolling_mean')).alias('burst_ratio')
         ])
     )
     
     # Join back to original data
     result_df = df.join(
-        rolling_features.select(['qid', 'month', 'rolling_entropy', 'rolling_cv', 'rolling_mean_filings']),
+        rolling_features.select([
+            'qid', 'month', 'rolling_cv', 'rolling_range_norm', 
+            'consistency_score', 'burst_ratio', 'rolling_mean'
+        ]),
         left_on=['qid', pl.col('filing_date').dt.truncate('1mo')],
         right_on=['qid', 'month'],
         how='left'
     )
     
     return result_df
+
+
+def calculate_true_rolling_entropy(df, window_months=12):
+    """
+    Calculate true entropy using a more manual approach that avoids Polars limitations
+    """
+    
+    # Create monthly data
+    monthly_data = (
+        df.with_columns([
+            pl.col('filing_date').dt.truncate('1mo').alias('month')
+        ])
+        .group_by(['qid', 'month'])
+        .agg([
+            pl.col('document_id').n_unique().alias('monthly_filings')
+        ])
+        .sort(['qid', 'month'])
+    )
+    
+    # Convert to list of dictionaries for manual processing
+    monthly_records = monthly_data.to_dicts()
+    
+    # Group by qid
+    qid_groups = {}
+    for record in monthly_records:
+        qid = record['qid']
+        if qid not in qid_groups:
+            qid_groups[qid] = []
+        qid_groups[qid].append(record)
+    
+    # Calculate rolling entropy for each qid
+    entropy_results = []
+    
+    for qid, records in qid_groups.items():
+        filings = [r['monthly_filings'] for r in records]
+        months = [r['month'] for r in records]
+        
+        for i in range(len(records)):
+            # Get window data (only historical)
+            start_idx = max(0, i - window_months + 1)
+            window_filings = filings[start_idx:i+1]
+            
+            if len(window_filings) >= 6:  # Minimum periods
+                # Calculate entropy
+                total = sum(window_filings)
+                if total > 0:
+                    probs = [f/total for f in window_filings if f > 0]
+                    if len(probs) > 1:
+                        ent = -sum(p * np.log(p) for p in probs)  # Manual entropy calculation
+                    else:
+                        ent = 0.0
+                else:
+                    ent = 0.0
+            else:
+                ent = np.nan
+            
+            entropy_results.append({
+                'qid': qid,
+                'month': months[i],
+                'rolling_entropy': ent,
+                'window_size': len(window_filings)
+            })
+    
+    # Convert back to polars
+    entropy_df = pl.DataFrame(entropy_results)
+    
+    # Join back to original data
+    result_df = df.join(
+        entropy_df.select(['qid', 'month', 'rolling_entropy']),
+        left_on=['qid', pl.col('filing_date').dt.truncate('1mo')],
+        right_on=['qid', 'month'],
+        how='left'
+    )
+    
+    return result_df
+
+
+# Example usage:
+if __name__ == "__main__":
+    # Sample data creation
+    sample_data = pl.DataFrame({
+        'qid': ['AAPL'] * 50 + ['MSFT'] * 50,
+        'document_id': [f'doc_{i}' for i in range(100)],
+        'sentence_id': list(range(100)),
+        'sentence_text': [f'text_{i}' for i in range(100)],
+        'filing_date': pl.date_range(
+            start=pl.date(2020, 1, 1),
+            end=pl.date(2024, 12, 31),
+            interval='1mo'
+        ).take(list(range(50)) * 2)
+    })
+    
+    # Test different methods
+    print("Testing vectorized approach (recommended):")
+    result1 = calculate_entropy_features_vectorized(sample_data)
+    print(result1.select(['qid', 'filing_date', 'rolling_cv', 'consistency_score']).head())
+    
+    print("\nTesting true entropy calculation:")
+    result2 = calculate_true_rolling_entropy(sample_data)
+    print(result2.select(['qid', 'filing_date', 'rolling_entropy']).head())
