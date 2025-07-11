@@ -1,3 +1,65 @@
+def calculate_rolling_entropy_features(df, window_months=12):
+    """
+    Calculate entropy using rolling window - most practical for trading
+    """
+    # Create monthly filing counts
+    monthly_data = (
+        df.with_columns([
+            pl.col('filing_date').dt.truncate('1mo').alias('month')
+        ])
+        .group_by(['qid', 'month'])
+        .agg([
+            pl.col('document_id').n_unique().alias('monthly_filings')
+        ])
+        .sort(['qid', 'month'])
+    )
+    
+    # Calculate rolling entropy
+    rolling_features = (
+        monthly_data
+        .with_columns([
+            # Rolling entropy using fixed window
+            pl.col('monthly_filings')
+            .map_batches(
+                lambda x: x.rolling_map(
+                    lambda window: entropy(window / window.sum() + 1e-10) if window.sum() > 0 else 0,
+                    window_size=window_months,
+                    min_periods=6  # Minimum 6 months of data
+                )
+            )
+            .over('qid')
+            .alias('rolling_entropy'),
+            
+            # Rolling coefficient of variation
+            pl.col('monthly_filings')
+            .rolling_std(window_size=window_months, min_periods=6)
+            .over('qid')
+            .truediv(
+                pl.col('monthly_filings')
+                .rolling_mean(window_size=window_months, min_periods=6)
+                .over('qid')
+            )
+            .alias('rolling_cv'),
+            
+            # Rolling burst indicator
+            pl.col('monthly_filings')
+            .rolling_mean(window_size=window_months, min_periods=6)
+            .over('qid')
+            .alias('rolling_mean_filings')
+        ])
+    )
+    
+    # Join back to original data
+    result_df = df.join(
+        rolling_features.select(['qid', 'month', 'rolling_entropy', 'rolling_cv', 'rolling_mean_filings']),
+        left_on=['qid', pl.col('filing_date').dt.truncate('1mo')],
+        right_on=['qid', 'month'],
+        how='left'
+    )
+    
+    return result_df
+
+
 def calculate_filing_regime_entropy(df, lookback_months=6):
     """
     Calculate entropy across three filing regimes: Low, Normal, High
