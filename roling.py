@@ -1,272 +1,303 @@
 import polars as pl
-import numpy as np
-from collections import Counter
-import re
-from typing import Dict, List, Optional
 from datetime import datetime, timedelta
-import warnings
-warnings.filterwarnings('ignore')
+import pandas as pd
 
-class FilingEntropySignal:
-    def __init__(self, df: pl.DataFrame, n_months: int = 3):
-        """
-        Initialize the entropy signal extractor.
-        
-        Args:
-            df: Polars DataFrame with columns [qid, document_id, sentence_id, sentence, date]
-            n_months: Number of months to look back for signal calculation
-        """
-        self.df = df
-        self.n_months = n_months
-        self.vocab_cache = {}
-        
-    def preprocess_text(self, text: str) -> List[str]:
-        """Clean and tokenize text efficiently."""
-        # Convert to lowercase and extract words
-        text = text.lower()
-        words = re.findall(r'\b[a-z]{2,}\b', text)
-        return words
-    
-    def calculate_entropy(self, tokens: List[str]) -> float:
-        """Calculate Shannon entropy of token distribution."""
-        if not tokens:
-            return 0.0
-            
-        # Count token frequencies
-        token_counts = Counter(tokens)
-        total_tokens = len(tokens)
-        
-        # Calculate entropy
-        entropy = 0.0
-        for count in token_counts.values():
-            prob = count / total_tokens
-            entropy -= prob * np.log2(prob)
-            
-        return entropy
-    
-    def get_document_entropy(self, sentences: List[str]) -> Dict[str, float]:
-        """Calculate various entropy measures for a document."""
-        # Combine all sentences in the document
-        all_text = " ".join(sentences)
-        tokens = self.preprocess_text(all_text)
-        
-        if not tokens:
-            return {
-                'word_entropy': 0.0,
-                'sentence_entropy': 0.0,
-                'avg_sentence_length': 0.0,
-                'unique_word_ratio': 0.0,
-                'total_words': 0
-            }
-        
-        # Word-level entropy
-        word_entropy = self.calculate_entropy(tokens)
-        
-        # Sentence-level entropy (based on sentence lengths)
-        sentence_lengths = [len(self.preprocess_text(sent)) for sent in sentences]
-        sentence_entropy = self.calculate_entropy([str(length) for length in sentence_lengths])
-        
-        # Additional features
-        unique_words = len(set(tokens))
-        unique_word_ratio = unique_words / len(tokens) if tokens else 0
-        avg_sentence_length = np.mean(sentence_lengths) if sentence_lengths else 0
-        
-        return {
-            'word_entropy': word_entropy,
-            'sentence_entropy': sentence_entropy,
-            'avg_sentence_length': avg_sentence_length,
-            'unique_word_ratio': unique_word_ratio,
-            'total_words': len(tokens)
-        }
-    
-    def calculate_filing_entropy(self, reference_date: Optional[str] = None) -> pl.DataFrame:
-        """
-        Calculate entropy measures for each filing within the specified time window.
-        
-        Args:
-            reference_date: Reference date to look back from (default: latest date in data)
-        """
-        # Convert date column to datetime if it's not already
-        df_with_date = self.df.with_columns([
-            pl.col('date').str.strptime(pl.Date, format='%Y-%m-%d', strict=False)
-        ])
-        
-        # Determine reference date
-        if reference_date is None:
-            ref_date = df_with_date.select(pl.col('date').max()).item()
-        else:
-            ref_date = datetime.strptime(reference_date, '%Y-%m-%d').date()
-        
-        # Filter data for the past n months
-        cutoff_date = ref_date - timedelta(days=self.n_months * 30)
-        
-        filtered_df = df_with_date.filter(
-            pl.col('date') >= cutoff_date
-        )
-        
-        # Group by qid and document_id to calculate entropy per filing
-        result_list = []
-        
-        # Process each document
-        for qid_doc in filtered_df.select(['qid', 'document_id', 'date']).unique().iter_rows():
-            qid, doc_id, doc_date = qid_doc
-            
-            # Get all sentences for this document
-            doc_sentences = filtered_df.filter(
-                (pl.col('qid') == qid) & (pl.col('document_id') == doc_id)
-            ).select('sentence').to_series().to_list()
-            
-            # Calculate entropy measures
-            entropy_measures = self.get_document_entropy(doc_sentences)
-            
-            # Add metadata
-            entropy_measures.update({
-                'qid': qid,
-                'document_id': doc_id,
-                'date': doc_date,
-                'num_sentences': len(doc_sentences)
-            })
-            
-            result_list.append(entropy_measures)
-        
-        # Convert to DataFrame
-        entropy_df = pl.DataFrame(result_list)
-        
-        return entropy_df
-    
-    def calculate_relative_entropy_signal(self, entropy_df: pl.DataFrame) -> pl.DataFrame:
-        """
-        Calculate relative entropy signals by comparing each filing to historical average.
-        """
-        # Calculate historical averages per qid
-        historical_stats = entropy_df.group_by('qid').agg([
-            pl.col('word_entropy').mean().alias('avg_word_entropy'),
-            pl.col('word_entropy').std().alias('std_word_entropy'),
-            pl.col('sentence_entropy').mean().alias('avg_sentence_entropy'),
-            pl.col('sentence_entropy').std().alias('std_sentence_entropy'),
-            pl.col('unique_word_ratio').mean().alias('avg_unique_word_ratio'),
-            pl.col('unique_word_ratio').std().alias('std_unique_word_ratio'),
-            pl.col('total_words').mean().alias('avg_total_words'),
-            pl.col('total_words').std().alias('std_total_words')
-        ])
-        
-        # Join with entropy data
-        signal_df = entropy_df.join(historical_stats, on='qid')
-        
-        # Calculate z-scores (standardized signals)
-        signal_df = signal_df.with_columns([
-            ((pl.col('word_entropy') - pl.col('avg_word_entropy')) / 
-             pl.col('std_word_entropy')).alias('word_entropy_zscore'),
-            ((pl.col('sentence_entropy') - pl.col('avg_sentence_entropy')) / 
-             pl.col('std_sentence_entropy')).alias('sentence_entropy_zscore'),
-            ((pl.col('unique_word_ratio') - pl.col('avg_unique_word_ratio')) / 
-             pl.col('std_unique_word_ratio')).alias('unique_ratio_zscore'),
-            ((pl.col('total_words') - pl.col('avg_total_words')) / 
-             pl.col('std_total_words')).alias('word_count_zscore')
-        ])
-        
-        # Create composite signal
-        signal_df = signal_df.with_columns([
-            (pl.col('word_entropy_zscore') * 0.4 + 
-             pl.col('sentence_entropy_zscore') * 0.3 + 
-             pl.col('unique_ratio_zscore') * 0.2 + 
-             pl.col('word_count_zscore') * 0.1).alias('composite_entropy_signal')
-        ])
-        
-        return signal_df
-    
-    def get_anomaly_filings(self, signal_df: pl.DataFrame, 
-                          threshold: float = 2.0) -> pl.DataFrame:
-        """
-        Identify filings with anomalous entropy patterns.
-        
-        Args:
-            signal_df: DataFrame with entropy signals
-            threshold: Z-score threshold for anomaly detection
-        """
-        anomalies = signal_df.filter(
-            pl.col('composite_entropy_signal').abs() > threshold
-        ).sort('composite_entropy_signal', descending=True)
-        
-        return anomalies
-    
-    def run_analysis(self, reference_date: Optional[str] = None, 
-                    anomaly_threshold: float = 2.0) -> Dict[str, pl.DataFrame]:
-        """
-        Run the complete entropy analysis pipeline.
-        
-        Returns:
-            Dictionary containing entropy_df, signal_df, and anomalies
-        """
-        print(f"Calculating entropy for filings in the past {self.n_months} months...")
-        
-        # Calculate basic entropy measures
-        entropy_df = self.calculate_filing_entropy(reference_date)
-        print(f"Processed {len(entropy_df)} filings")
-        
-        # Calculate relative signals
-        signal_df = self.calculate_relative_entropy_signal(entropy_df)
-        print("Calculated relative entropy signals")
-        
-        # Find anomalies
-        anomalies = self.get_anomaly_filings(signal_df, anomaly_threshold)
-        print(f"Found {len(anomalies)} anomalous filings")
-        
-        return {
-            'entropy_df': entropy_df,
-            'signal_df': signal_df,
-            'anomalies': anomalies
-        }
-
-# Example usage and performance optimization
-def optimize_dataframe(df: pl.DataFrame) -> pl.DataFrame:
-    """Optimize DataFrame for memory and speed."""
-    return df.with_columns([
-        pl.col('qid').cast(pl.Categorical),
-        pl.col('document_id').cast(pl.Categorical),
-        pl.col('sentence_id').cast(pl.UInt32),
-        pl.col('date').cast(pl.Date)
-    ])
-
-# Example usage
-if __name__ == "__main__":
-    # Sample data creation (replace with your actual data)
-    sample_data = {
-        'qid': ['AAPL', 'AAPL', 'GOOGL', 'GOOGL', 'MSFT'] * 100,
-        'document_id': ['doc1', 'doc1', 'doc2', 'doc2', 'doc3'] * 100,
-        'sentence_id': list(range(500)),
-        'sentence': ['This is a sample sentence about financial performance.'] * 500,
-        'date': ['2024-01-15', '2024-01-15', '2024-02-20', '2024-02-20', '2024-03-10'] * 100
+# Sample data creation
+def create_sample_data():
+    """Create sample data for demonstration"""
+    data = {
+        'id': ['A', 'A', 'A', 'B', 'B', 'C', 'C', 'C', 'A', 'B'],
+        'doc_id': ['doc1', 'doc2', 'doc3', 'doc4', 'doc5', 'doc6', 'doc7', 'doc8', 'doc9', 'doc10'],
+        'date': [
+            '2024-01-15', '2024-03-20', '2024-06-10', 
+            '2024-02-05', '2024-07-12', 
+            '2024-01-30', '2024-04-25', '2024-08-15',
+            '2024-09-01', '2024-10-15'
+        ],
+        'doc_length': [100, 150, 200, 120, 180, 90, 160, 140, 110, 170]
     }
     
-    df = pl.DataFrame(sample_data)
-    df = optimize_dataframe(df)
-    
-    # Initialize analyzer
-    analyzer = FilingEntropySignal(df, n_months=3)
-    
-    # Run analysis
-    results = analyzer.run_analysis(anomaly_threshold=1.5)
-    
-    # Display results
-    print("\nTop 5 Entropy Signals:")
-    print(results['signal_df'].select([
-        'qid', 'document_id', 'date', 'word_entropy', 
-        'composite_entropy_signal'
-    ]).sort('composite_entropy_signal', descending=True).head(5))
-    
-    print("\nAnomalous Filings:")
-    print(results['anomalies'].select([
-        'qid', 'document_id', 'date', 'composite_entropy_signal'
-    ]).head(10))
+    df = pl.DataFrame(data)
+    df = df.with_columns(pl.col('date').str.to_date())
+    return df
 
-# Initialize with your data
-analyzer = FilingEntropySignal(df, n_months=3)
+# Method 1: Using rolling aggregation with time window
+def rolling_sum_method1(df, window_months=6):
+    """
+    Method 1: Using Polars' rolling aggregation with time window
+    Most efficient for time-based windows
+    """
+    # Convert months to days (approximate)
+    window_days = f"{window_months * 30}d"
+    
+    result = (
+        df
+        .sort(['id', 'date'])
+        .with_columns([
+            # Count documents in rolling window
+            pl.col('doc_id').count().over(
+                pl.col('id'), 
+                order_by=pl.col('date'),
+                mapping_strategy='join'
+            ).rolling_count(window_size=window_days, by='date').alias('rolling_doc_count'),
+            
+            # Sum document lengths in rolling window  
+            pl.col('doc_length').rolling_sum(
+                window_size=window_days, 
+                by='date'
+            ).over('id').alias('rolling_length_sum')
+        ])
+    )
+    
+    return result
 
-# Run complete analysis
-results = analyzer.run_analysis(anomaly_threshold=1.5)
+# Method 2: Using group_by_dynamic for precise month windows
+def rolling_sum_method2(df, window_months=6):
+    """
+    Method 2: Using group_by_dynamic for more precise time windows
+    Better for exact month calculations
+    """
+    # Create a complete date range for each ID
+    date_range = df.select([
+        pl.col('date').min().alias('min_date'),
+        pl.col('date').max().alias('max_date')
+    ]).to_dicts()[0]
+    
+    # Generate all dates in range
+    all_dates = pl.date_range(
+        date_range['min_date'], 
+        date_range['max_date'], 
+        interval='1d',
+        eager=True
+    ).to_frame('date')
+    
+    # Get unique IDs
+    unique_ids = df.select('id').unique()
+    
+    # Create complete grid
+    complete_grid = unique_ids.join(all_dates, how='cross')
+    
+    # Join with original data
+    expanded_df = complete_grid.join(df, on=['id', 'date'], how='left')
+    
+    # Calculate rolling sum
+    result = (
+        expanded_df
+        .sort(['id', 'date'])
+        .with_columns([
+            pl.col('doc_id').fill_null('').alias('doc_id'),
+            pl.col('doc_length').fill_null(0).alias('doc_length')
+        ])
+        .with_columns([
+            # Rolling count of non-null documents
+            (pl.col('doc_id') != '').cast(pl.Int32).rolling_sum(
+                window_size=f"{window_months * 30}d", 
+                by='date'
+            ).over('id').alias('rolling_doc_count'),
+            
+            # Rolling sum of document lengths
+            pl.col('doc_length').rolling_sum(
+                window_size=f"{window_months * 30}d", 
+                by='date'
+            ).over('id').alias('rolling_length_sum')
+        ])
+        # Filter back to original dates with documents
+        .filter(pl.col('doc_id') != '')
+    )
+    
+    return result
 
-# Access results
-entropy_df = results['entropy_df']      # Basic entropy measures
-signal_df = results['signal_df']        # Relative signals with z-scores
-anomalies = results['anomalies']        # Unusual filings
+# Method 3: Custom implementation with precise month calculation
+def rolling_sum_method3(df, window_months=6):
+    """
+    Method 3: Custom implementation for exact month windows
+    Most flexible but potentially slower for large datasets
+    """
+    def calculate_rolling_metrics(group_df):
+        """Calculate rolling metrics for a single ID group"""
+        group_df = group_df.sort('date')
+        rolling_counts = []
+        rolling_sums = []
+        
+        for i, row in enumerate(group_df.iter_rows(named=True)):
+            current_date = row['date']
+            # Calculate date 6 months ago
+            start_date = current_date.replace(
+                month=current_date.month - window_months if current_date.month > window_months 
+                else current_date.month - window_months + 12,
+                year=current_date.year if current_date.month > window_months 
+                else current_date.year - 1
+            )
+            
+            # Filter documents in window
+            window_docs = group_df.filter(
+                (pl.col('date') >= start_date) & (pl.col('date') <= current_date)
+            )
+            
+            rolling_counts.append(len(window_docs))
+            rolling_sums.append(window_docs.select(pl.col('doc_length').sum()).item())
+        
+        return group_df.with_columns([
+            pl.Series('rolling_doc_count', rolling_counts),
+            pl.Series('rolling_length_sum', rolling_sums)
+        ])
+    
+    # Apply to each ID group
+    result = (
+        df
+        .sort(['id', 'date'])
+        .group_by('id', maintain_order=True)
+        .map_groups(calculate_rolling_metrics)
+    )
+    
+    return result
+
+# Method 4: Using window functions with range-based window
+def rolling_sum_method4(df, window_months=6):
+    """
+    Method 4: Using window functions with date range
+    Good balance of performance and precision
+    """
+    # Convert to days (approximate)
+    window_days = window_months * 30
+    
+    result = (
+        df
+        .sort(['id', 'date'])
+        .with_columns([
+            # Calculate days since epoch for each date
+            (pl.col('date') - pl.date(1970, 1, 1)).dt.total_days().alias('days_since_epoch')
+        ])
+        .with_columns([
+            # Rolling count using row-based window with date constraint
+            pl.len().over(
+                'id',
+                order_by='days_since_epoch',
+                mapping_strategy='join'
+            ).alias('temp_count'),
+            
+            # Custom rolling calculation
+            pl.struct(['date', 'doc_length']).map_elements(
+                lambda x: 1,  # Count each document
+                return_dtype=pl.Int32
+            ).cumsum().over('id').alias('cumulative_count')
+        ])
+    )
+    
+    # For precise calculation, we need to use a different approach
+    result = (
+        df
+        .sort(['id', 'date'])
+        .with_columns([
+            # Create a lagged date column for window start
+            pl.col('date').shift(1).over('id').alias('prev_date')
+        ])
+        .with_columns([
+            # Calculate rolling count for each row
+            pl.struct(['id', 'date']).map_elements(
+                lambda row: df.filter(
+                    (pl.col('id') == row['id']) & 
+                    (pl.col('date') <= row['date']) &
+                    (pl.col('date') >= row['date'] - timedelta(days=window_months*30))
+                ).height,
+                return_dtype=pl.Int32
+            ).alias('rolling_doc_count'),
+            
+            # Calculate rolling sum for each row  
+            pl.struct(['id', 'date']).map_elements(
+                lambda row: df.filter(
+                    (pl.col('id') == row['id']) & 
+                    (pl.col('date') <= row['date']) &
+                    (pl.col('date') >= row['date'] - timedelta(days=window_months*30))
+                ).select(pl.col('doc_length').sum()).item(),
+                return_dtype=pl.Int64
+            ).alias('rolling_length_sum')
+        ])
+        .drop('prev_date')
+    )
+    
+    return result
+
+# Optimized Method: Recommended approach
+def rolling_sum_optimized(df, window_months=6):
+    """
+    Optimized method combining efficiency with accuracy
+    Recommended for most use cases
+    """
+    window_duration = f"{window_months * 30}d"
+    
+    result = (
+        df
+        .sort(['id', 'date'])
+        .group_by('id', maintain_order=True)
+        .map_groups(
+            lambda group: group.with_columns([
+                # Rolling count of documents
+                pl.lit(1).rolling_sum(
+                    window_size=window_duration,
+                    by='date'
+                ).alias('rolling_doc_count'),
+                
+                # Rolling sum of document lengths
+                pl.col('doc_length').rolling_sum(
+                    window_size=window_duration,
+                    by='date'
+                ).alias('rolling_length_sum')
+            ])
+        )
+    )
+    
+    return result
+
+# Example usage and testing
+def main():
+    # Create sample data
+    df = create_sample_data()
+    print("Original DataFrame:")
+    print(df)
+    print("\n" + "="*50 + "\n")
+    
+    # Test different methods
+    print("Method 1 - Basic rolling with time window:")
+    result1 = rolling_sum_optimized(df, window_months=6)
+    print(result1)
+    print("\n" + "="*50 + "\n")
+    
+    # Performance comparison for larger datasets
+    print("For production use, Method 'rolling_sum_optimized' is recommended")
+    print("It provides the best balance of performance and accuracy")
+
+if __name__ == "__main__":
+    main()
+
+# Additional utility functions
+def validate_results(df, result_df):
+    """Validate that rolling calculations are correct"""
+    # Manual check for first few rows
+    for row in result_df.head(3).iter_rows(named=True):
+        id_val = row['id']
+        date_val = row['date']
+        window_start = date_val - timedelta(days=6*30)  # 6 months approximation
+        
+        manual_count = df.filter(
+            (pl.col('id') == id_val) & 
+            (pl.col('date') <= date_val) &
+            (pl.col('date') >= window_start)
+        ).height
+        
+        print(f"ID: {id_val}, Date: {date_val}")
+        print(f"Calculated: {row['rolling_doc_count']}, Manual: {manual_count}")
+        print(f"Match: {row['rolling_doc_count'] == manual_count}\n")
+
+# Performance optimization tips:
+"""
+Performance Tips:
+1. Use rolling_sum_optimized() for most cases
+2. For very large datasets, consider:
+   - Partitioning by ID if memory is limited
+   - Using lazy evaluation: df.lazy().collect() 
+   - Filtering date ranges before calculation
+3. For exact month calculations (not 30-day approximation):
+   - Use Method 3 but consider performance trade-offs
+4. Index your data by ['id', 'date'] for faster operations
+"""
