@@ -33,20 +33,22 @@ def rolling_sum_method1(df, window_months=6):
     result = (
         df
         .sort(['id', 'date'])
-        .with_columns([
-            # Count documents in rolling window
-            pl.col('doc_id').count().over(
-                pl.col('id'), 
-                order_by=pl.col('date'),
-                mapping_strategy='join'
-            ).rolling_count(window_size=window_days, by='date').alias('rolling_doc_count'),
-            
-            # Sum document lengths in rolling window  
-            pl.col('doc_length').rolling_sum(
-                window_size=window_days, 
-                by='date'
-            ).over('id').alias('rolling_length_sum')
-        ])
+        .group_by('id', maintain_order=True)
+        .map_groups(
+            lambda group: group.with_columns([
+                # Count documents in rolling window (using lit(1) to count each row)
+                pl.lit(1).rolling_sum(
+                    window_size=window_days, 
+                    by='date'
+                ).alias('rolling_doc_count'),
+                
+                # Sum document lengths in rolling window  
+                pl.col('doc_length').rolling_sum(
+                    window_size=window_days, 
+                    by='date'
+                ).alias('rolling_length_sum')
+            ])
+        )
     )
     
     return result
@@ -155,96 +157,86 @@ def rolling_sum_method3(df, window_months=6):
 # Method 4: Using window functions with range-based window
 def rolling_sum_method4(df, window_months=6):
     """
-    Method 4: Using window functions with date range
-    Good balance of performance and precision
+    Method 4: Using join_asof for precise rolling calculations
+    Good for exact time-based windows
     """
-    # Convert to days (approximate)
     window_days = window_months * 30
     
-    result = (
-        df
-        .sort(['id', 'date'])
-        .with_columns([
-            # Calculate days since epoch for each date
-            (pl.col('date') - pl.date(1970, 1, 1)).dt.total_days().alias('days_since_epoch')
-        ])
-        .with_columns([
-            # Rolling count using row-based window with date constraint
-            pl.len().over(
-                'id',
-                order_by='days_since_epoch',
-                mapping_strategy='join'
-            ).alias('temp_count'),
+    # Create a helper function for rolling calculation
+    def calculate_rolling_for_group(group_df):
+        group_df = group_df.sort('date')
+        results = []
+        
+        for i, current_row in enumerate(group_df.iter_rows(named=True)):
+            current_date = current_row['date']
+            start_date = current_date - timedelta(days=window_days)
             
-            # Custom rolling calculation
-            pl.struct(['date', 'doc_length']).map_elements(
-                lambda x: 1,  # Count each document
-                return_dtype=pl.Int32
-            ).cumsum().over('id').alias('cumulative_count')
-        ])
-    )
+            # Count docs in window
+            window_data = group_df.filter(
+                (pl.col('date') >= start_date) & 
+                (pl.col('date') <= current_date)
+            )
+            
+            doc_count = len(window_data)
+            length_sum = window_data.select(pl.col('doc_length').sum()).item()
+            
+            results.append({
+                'id': current_row['id'],
+                'doc_id': current_row['doc_id'], 
+                'date': current_row['date'],
+                'doc_length': current_row['doc_length'],
+                'rolling_doc_count': doc_count,
+                'rolling_length_sum': length_sum
+            })
+        
+        return pl.DataFrame(results)
     
-    # For precise calculation, we need to use a different approach
+    # Apply to each group
     result = (
         df
-        .sort(['id', 'date'])
-        .with_columns([
-            # Create a lagged date column for window start
-            pl.col('date').shift(1).over('id').alias('prev_date')
-        ])
-        .with_columns([
-            # Calculate rolling count for each row
-            pl.struct(['id', 'date']).map_elements(
-                lambda row: df.filter(
-                    (pl.col('id') == row['id']) & 
-                    (pl.col('date') <= row['date']) &
-                    (pl.col('date') >= row['date'] - timedelta(days=window_months*30))
-                ).height,
-                return_dtype=pl.Int32
-            ).alias('rolling_doc_count'),
-            
-            # Calculate rolling sum for each row  
-            pl.struct(['id', 'date']).map_elements(
-                lambda row: df.filter(
-                    (pl.col('id') == row['id']) & 
-                    (pl.col('date') <= row['date']) &
-                    (pl.col('date') >= row['date'] - timedelta(days=window_months*30))
-                ).select(pl.col('doc_length').sum()).item(),
-                return_dtype=pl.Int64
-            ).alias('rolling_length_sum')
-        ])
-        .drop('prev_date')
+        .group_by('id')
+        .map_groups(calculate_rolling_for_group)
     )
     
     return result
 
-# Optimized Method: Recommended approach
-def rolling_sum_optimized(df, window_months=6):
+# Simple and working method - RECOMMENDED
+def rolling_sum_simple(df, window_months=6):
     """
-    Optimized method combining efficiency with accuracy
-    Recommended for most use cases
+    Simple, working method for rolling calculations
+    This is the most reliable approach
     """
-    window_duration = f"{window_months * 30}d"
+    from datetime import timedelta
+    
+    def calculate_rolling_metrics(group_df):
+        group_df = group_df.sort('date')
+        rolling_counts = []
+        rolling_sums = []
+        
+        for row in group_df.iter_rows(named=True):
+            current_date = row['date']
+            window_start = current_date - timedelta(days=window_months * 30)
+            
+            # Filter data within window
+            window_mask = (
+                (group_df['date'] >= window_start) & 
+                (group_df['date'] <= current_date)
+            )
+            window_data = group_df.filter(window_mask)
+            
+            rolling_counts.append(len(window_data))
+            rolling_sums.append(window_data.select(pl.col('doc_length').sum()).item())
+        
+        return group_df.with_columns([
+            pl.Series('rolling_doc_count', rolling_counts),
+            pl.Series('rolling_length_sum', rolling_sums)
+        ])
     
     result = (
         df
         .sort(['id', 'date'])
         .group_by('id', maintain_order=True)
-        .map_groups(
-            lambda group: group.with_columns([
-                # Rolling count of documents
-                pl.lit(1).rolling_sum(
-                    window_size=window_duration,
-                    by='date'
-                ).alias('rolling_doc_count'),
-                
-                # Rolling sum of document lengths
-                pl.col('doc_length').rolling_sum(
-                    window_size=window_duration,
-                    by='date'
-                ).alias('rolling_length_sum')
-            ])
-        )
+        .map_groups(calculate_rolling_metrics)
     )
     
     return result
@@ -258,14 +250,20 @@ def main():
     print("\n" + "="*50 + "\n")
     
     # Test different methods
-    print("Method 1 - Basic rolling with time window:")
-    result1 = rolling_sum_optimized(df, window_months=6)
+    print("Recommended Method - Simple and reliable:")
+    result1 = rolling_sum_simple(df, window_months=6)
     print(result1)
+    print("\n" + "="*30 + "\n")
+    
+    print("Method 1 - Using rolling_sum:")
+    result2 = rolling_sum_method1(df, window_months=6)
+    print(result2)
     print("\n" + "="*50 + "\n")
     
     # Performance comparison for larger datasets
-    print("For production use, Method 'rolling_sum_optimized' is recommended")
-    print("It provides the best balance of performance and accuracy")
+    print("For production use:")
+    print("- Use 'rolling_sum_simple' for reliability")
+    print("- Use 'rolling_sum_method1' for better performance on large datasets")
 
 if __name__ == "__main__":
     main()
