@@ -113,3 +113,30 @@ def chunked_rolling_sections(df, chunk_size=1_000_000):
         results.append(chunk_result)
     
     return pl.concat(results)
+
+# For datasets > 10GB, consider this approach
+def memory_efficient_approach(df):
+    return (
+        df.lazy()
+        .with_columns([
+            pl.col('date').cast(pl.Date)
+        ])
+        # Only select necessary columns early
+        .select(['qid', 'date', 'section'])
+        .filter(pl.col('section').is_not_null())
+        .sort(['qid', 'date'])
+        .group_by('qid', maintain_order=True)
+        .map_groups(
+            lambda group: group.with_columns([
+                pl.col('section')
+                .rolling_list(window_size='180d', min_periods=1)
+                .alias('sections_180d')
+            ])
+        )
+        .collect(
+            streaming=True,
+            slice_pushdown=True,
+            predicate_pushdown=True,
+            projection_pushdown=True
+        )
+    )
