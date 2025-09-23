@@ -89,3 +89,30 @@ def sql_style_rolling(df):
         ])
         .sort(['qid', 'date'])
     )
+
+import polars as pl
+from datetime import timedelta
+
+# Ensure date column is properly typed
+df = df.with_columns(pl.col("date").cast(pl.Date))
+
+# Sort by qid and date for efficient window operations
+df = df.sort(["qid", "date"])
+
+# Create rolling aggregation
+result = df.with_columns(
+    pl.col("section")
+    .filter(pl.col("section").is_not_null())  # Only non-null sections
+    .list.eval(pl.element().drop_nulls())     # Remove nulls from each group
+    .over(
+        "qid", 
+        order_by="date",
+        mapping_strategy="group_to_rows"
+    )
+    .rolling_map(
+        function=lambda s: s.explode().unique().sort(),
+        window_size=timedelta(days=181),  # 180 days + current day
+        min_periods=1
+    )
+    .alias("sections_180d")
+)
