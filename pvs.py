@@ -60,3 +60,32 @@ def chunked_rolling_sections(df, chunk_size=10000):
         print(f"Processed {min(i + chunk_size, len(unique_qids))} / {len(unique_qids)} qids")
     
     return pl.concat(results)
+
+
+def sql_style_rolling(df):
+    """
+    SQL-style approach that works reliably
+    """
+    clean_df = df.filter(pl.col('section').is_not_null())
+    
+    return (
+        clean_df
+        .select(['qid', 'date'])
+        .unique()
+        .sort(['qid', 'date'])
+        .join(
+            clean_df.select(['qid', 'date', 'section']),
+            on='qid',
+            how='left',
+            suffix='_section'
+        )
+        .filter(
+            (pl.col('date_section') <= pl.col('date')) &
+            (pl.col('date_section') >= pl.col('date') - pl.duration(days=180))
+        )
+        .group_by(['qid', 'date'])
+        .agg([
+            pl.col('section').drop_nulls().alias('sections_180d')
+        ])
+        .sort(['qid', 'date'])
+    )
