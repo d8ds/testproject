@@ -35,3 +35,28 @@ def pure_polars_rolling(df):
         .group_by('qid', maintain_order=True)
         .map_groups(rolling_agg)
     )
+
+
+def chunked_rolling_sections(df, chunk_size=10000):
+    """
+    Process in chunks for very large datasets
+    """
+    clean_df = df.filter(pl.col('section').is_not_null()).sort(['qid', 'date'])
+    unique_qids = clean_df.get_column('qid').unique().to_list()
+    
+    results = []
+    
+    # Process qids in chunks
+    for i in range(0, len(unique_qids), chunk_size):
+        chunk_qids = unique_qids[i:i + chunk_size]
+        
+        chunk_result = sql_style_rolling(
+            clean_df.filter(pl.col('qid').is_in(chunk_qids))
+        )
+        
+        results.append(chunk_result)
+        
+        # Optional: print progress
+        print(f"Processed {min(i + chunk_size, len(unique_qids))} / {len(unique_qids)} qids")
+    
+    return pl.concat(results)
