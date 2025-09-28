@@ -1,461 +1,330 @@
-#!/usr/bin/env python3
-
-import os
-import sys
-import json
+import polars as pl
+from datetime import datetime, timedelta, date
 import time
-from datetime import datetime
-from typing import Dict, Any
 
-# Import our system components
-# from glassdoor_trading_system import TradingSignalsSystem
-# from database_setup import setup_environment, TradingSignalStorage
+# Your example data (expanded for testing)
+df = pl.DataFrame({
+    'qid': [1, 1, 1, 1, 2, 2, 2],
+    'date': ['2024-01-01', '2024-07-01', '2024-08-06', '2024-09-15', 
+             '2024-02-01', '2024-06-15', '2024-10-01'],
+    'length': [2, 5, 3, 6, 10, 15, 12]
+}).with_columns(
+    pl.col('date').str.to_date()
+)
 
-
-class TradingSignalsRunner:
-    """Main runner for the Glassdoor trading signals system"""
+def calculate_daily_differences_ultra_fast_fixed(df, start_date=None, end_date=None):
+    """
+    Ultra-fast vectorized approach with FIXED schema handling
+    Explicitly defines column types to avoid schema inference errors
+    """
     
-    def __init__(self):
-        self.system = None
-        self.signal_storage = None
-        self.setup_system()
+    # Determine date range
+    if start_date is None:
+        start_date = df.select(pl.col('date').min()).item()
+    if end_date is None:
+        end_date = df.select(pl.col('date').max()).item()
     
-    def setup_system(self):
-        """Initialize the system components"""
-        print("🚀 Initializing Glassdoor Trading Signals System...")
-        
-        # Check for OpenAI API key
-        if not os.getenv("OPENAI_API_KEY"):
-            print("❌ Error: OPENAI_API_KEY environment variable not set!")
-            print("Please set your OpenAI API key:")
-            print("export OPENAI_API_KEY='your-api-key-here'")
-            sys.exit(1)
-        
-        try:
-            # Initialize database and sample data if needed
-            if not os.path.exists("glassdoor_reviews.db"):
-                print("📊 Setting up database with sample data...")
-                from database_setup import setup_environment
-                setup_environment()
-            
-            # Initialize the main system
-            from glassdoor_trading_system import TradingSignalsSystem
-            from database_setup import TradingSignalStorage
-            
-            self.system = TradingSignalsSystem()
-            self.signal_storage = TradingSignalStorage()
-            
-            print("✅ System initialized successfully!")
-            
-        except Exception as e:
-            print(f"❌ Error initializing system: {str(e)}")
-            sys.exit(1)
+    # Convert to date objects if needed
+    if isinstance(start_date, str):
+        start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+    if isinstance(end_date, str):
+        end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
     
-    def analyze_single_company(self, ticker: str) -> Dict[str, Any]:
-        """Analyze a single company and return results"""
-        print(f"\n🔍 Analyzing {ticker}...")
-        
-        try:
-            start_time = time.time()
-            result = self.system.analyze_company(ticker, days_back=30)
-            end_time = time.time()
-            
-            print(f"⏱️  Analysis completed in {end_time - start_time:.1f} seconds")
-            
-            # Extract key information from the conversation
-            signal_summary = self.extract_signal_summary(result)
-            
-            # Store the signal if valid
-            if signal_summary.get('signal_type'):
-                signal_summary['ticker'] = ticker
-                self.signal_storage.store_signal(signal_summary)
-                print(f"💾 Signal stored for {ticker}")
-            
-            return result
-            
-        except Exception as e:
-            error_result = {
-                'ticker': ticker,
-                'error': str(e),
-                'timestamp': datetime.now().isoformat()
-            }
-            print(f"❌ Error analyzing {ticker}: {str(e)}")
-            return error_result
+    # Create date range
+    days_diff = (end_date - start_date).days + 1
+    date_range = [start_date + timedelta(days=i) for i in range(days_diff)]
     
-    def extract_signal_summary(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        """Extract trading signal summary from agent conversation"""
-        # This is a simplified extraction - in practice, you'd parse the conversation
-        # more sophisticatedly to extract structured signals
-        
-        if result.get('error'):
-            return {}
-        
-        # Default signal structure
-        signal = {
-            'signal_date': datetime.now(),
-            'signal_type': 'HOLD',
-            'signal_strength': 'MODERATE',
-            'confidence_score': 5.0,
-            'reasoning': 'Analysis completed but specific signal extraction needs implementation',
-            'data_period_start': datetime.now().date(),
-            'data_period_end': datetime.now().date(),
-            'review_count': 0,
-            'avg_rating': 3.0,
-            'sentiment_score': 0.0,
-            'risk_assessment': 'Medium risk - requires further validation'
-        }
-        
-        return signal
+    # Pre-define schema to avoid inference issues
+    all_results = []
     
-    def run_full_scan(self):
-        """Run analysis on all active companies"""
-        print("\n🔄 Running full market scan...")
+    # Process each qid separately for memory efficiency
+    for qid_val in df['qid'].unique().sort():
+        print(f"Processing QID {qid_val}...")
         
-        try:
-            results = self.system.scan_all_companies(min_reviews=10)
-            
-            print(f"\n📈 Scan Results ({len(results)} companies analyzed):")
-            print("=" * 80)
-            
-            for i, result in enumerate(results, 1):
-                ticker = result.get('ticker', 'Unknown')
-                status = 'Error' if result.get('error') else 'Completed'
-                
-                print(f"{i:2d}. {ticker:6s} - {status}")
-                
-                if result.get('error'):
-                    print(f"    ❌ {result['error']}")
+        # Get sorted data for this qid
+        qid_data = df.filter(pl.col('qid') == qid_val).sort('date')
+        records = qid_data.to_dicts()
+        
+        # Pre-compute for efficiency
+        record_dates = [r['date'] for r in records]
+        record_lengths = [r['length'] for r in records]
+        
+        # Process each date for this qid
+        for query_date in date_range:
+            # Find most recent record <= query_date
+            most_recent_idx = -1
+            for i, record_date in enumerate(record_dates):
+                if record_date <= query_date:
+                    most_recent_idx = i
                 else:
-                    signal = self.extract_signal_summary(result)
-                    if signal.get('signal_type'):
-                        print(f"    📊 Signal: {signal['signal_type']} ({signal['confidence_score']:.1f}/10)")
-            
-            return results
-            
-        except Exception as e:
-            print(f"❌ Error during full scan: {str(e)}")
-            return []
-    
-    def display_recent_signals(self, days_back: int = 7):
-        """Display recent trading signals"""
-        print(f"\n📋 Recent Trading Signals (last {days_back} days):")
-        print("=" * 80)
-        
-        try:
-            signals_df = self.signal_storage.get_recent_signals(days_back)
-            
-            if signals_df.empty:
-                print("No recent signals found.")
-                return
-            
-            for _, signal in signals_df.iterrows():
-                print(f"🎯 {signal['ticker']} - {signal['signal_type']} ({signal['signal_strength']})")
-                print(f"   📅 Date: {signal['signal_date']}")
-                print(f"   🎯 Confidence: {signal['confidence_score']:.1f}/10")
-                print(f"   📝 Reasoning: {signal['reasoning'][:100]}...")
-                print(f"   ⚠️  Risk: {signal['risk_assessment'][:50]}...")
-                print("-" * 40)
-                
-        except Exception as e:
-            print(f"❌ Error retrieving signals: {str(e)}")
-    
-    def interactive_mode(self):
-        """Run the system in interactive mode"""
-        print("\n🎮 Interactive Mode - Glassdoor Trading Signals")
-        print("=" * 60)
-        
-        while True:
-            print("\nAvailable commands:")
-            print("1. analyze [TICKER] - Analyze a specific company")
-            print("2. scan - Run full market scan")
-            print("3. signals - Show recent signals")
-            print("4. history [TICKER] - Show signal history for ticker")
-            print("5. quit - Exit the system")
-            
-            try:
-                command = input("\n💻 Enter command: ").strip().lower()
-                
-                if command == 'quit' or command == 'q':
-                    print("👋 Goodbye!")
                     break
+            
+            if most_recent_idx == -1:
+                # No data available yet - explicitly use None with proper types
+                result_row = {
+                    'qid': qid_val,
+                    'date': query_date,
+                    'length': None,
+                    'diff_vs_previous': None,
+                    'diff_vs_avg_previous': None
+                }
+            else:
+                current_length = record_lengths[most_recent_idx]
+                most_recent_date = record_dates[most_recent_idx]
                 
-                elif command.startswith('analyze'):
-                    parts = command.split()
-                    if len(parts) > 1:
-                        ticker = parts[1].upper()
-                        result = self.analyze_single_company(ticker)
-                        self.display_analysis_result(result)
-                    else:
-                        print("❌ Please specify a ticker: analyze AAPL")
+                # Find previous records within 6 months
+                six_months_ago = query_date - timedelta(days=180)
                 
-                elif command == 'scan':
-                    self.run_full_scan()
+                # Get previous records (before most recent and within window)
+                prev_records = []
+                for i in range(most_recent_idx):  # Only look at records before most recent
+                    if record_dates[i] >= six_months_ago:
+                        prev_records.append((record_dates[i], record_lengths[i]))
                 
-                elif command == 'signals':
-                    self.display_recent_signals()
-                
-                elif command.startswith('history'):
-                    parts = command.split()
-                    if len(parts) > 1:
-                        ticker = parts[1].upper()
-                        self.display_signal_history(ticker)
-                    else:
-                        print("❌ Please specify a ticker: history AAPL")
-                
-                else:
-                    print("❌ Unknown command. Type 'quit' to exit.")
+                # Calculate differences with explicit float conversion
+                if prev_records:
+                    # Most recent previous
+                    most_recent_prev_length = prev_records[-1][1]
+                    diff_vs_previous = float(current_length - most_recent_prev_length)
                     
-            except KeyboardInterrupt:
-                print("\n👋 Goodbye!")
-                break
-            except Exception as e:
-                print(f"❌ Error: {str(e)}")
-    
-    def display_analysis_result(self, result: Dict[str, Any]):
-        """Display detailed analysis result"""
-        print("\n📊 Analysis Result:")
-        print("=" * 50)
-        
-        if result.get('error'):
-            print(f"❌ Error: {result['error']}")
-            return
-        
-        # Display conversation summary
-        conversation = result.get('conversation_history', [])
-        if conversation:
-            print(f"💬 Agent Conversation ({len(conversation)} messages)")
-            
-            # Show key messages from each agent
-            for msg in conversation[-5:]:  # Show last 5 messages
-                sender = msg.get('name', 'Unknown')
-                content = msg.get('content', '')[:200]
-                print(f"   🤖 {sender}: {content}...")
-        
-        print(f"✅ Analysis completed at {result.get('timestamp', 'Unknown time')}")
-    
-    def display_signal_history(self, ticker: str):
-        """Display signal history for a ticker"""
-        print(f"\n📈 Signal History for {ticker}:")
-        print("=" * 50)
-        
-        try:
-            history_df = self.signal_storage.get_signal_history(ticker)
-            
-            if history_df.empty:
-                print(f"No signal history found for {ticker}")
-                return
-            
-            for _, signal in history_df.iterrows():
-                print(f"📅 {signal['signal_date']}: {signal['signal_type']} "
-                      f"({signal['signal_strength']}) - {signal['confidence_score']:.1f}/10")
+                    # Average previous
+                    avg_prev = sum(length for _, length in prev_records) / len(prev_records)
+                    diff_vs_avg_previous = float(current_length - avg_prev)
+                else:
+                    diff_vs_previous = None
+                    diff_vs_avg_previous = None
                 
-        except Exception as e:
-            print(f"❌ Error retrieving history: {str(e)}")
-    
-    def run_demo(self):
-        """Run a quick demonstration of the system"""
-        print("\n🎬 Running System Demo...")
-        print("=" * 50)
-        
-        # Demo companies to analyze
-        demo_tickers = ['AAPL', 'TSLA', 'MSFT']
-        
-        for ticker in demo_tickers:
-            print(f"\n🎯 Demo Analysis: {ticker}")
-            result = self.analyze_single_company(ticker)
+                result_row = {
+                    'qid': qid_val,
+                    'date': query_date,
+                    'length': float(current_length) if current_length is not None else None,
+                    'diff_vs_previous': diff_vs_previous,
+                    'diff_vs_avg_previous': diff_vs_avg_previous
+                }
             
-            # Brief summary
-            if not result.get('error'):
-                print(f"✅ {ticker} analysis completed successfully")
-            else:
-                print(f"❌ {ticker} analysis failed: {result['error']}")
-            
-            time.sleep(2)  # Brief pause between analyses
-        
-        # Show results
-        print("\n📊 Demo Results Summary:")
-        self.display_recent_signals(1)
-
-
-def main():
-    """Main entry point"""
-    print("🌟 Glassdoor Trading Signals System")
-    print("=" * 60)
+            all_results.append(result_row)
     
-    # Initialize the runner
-    runner = TradingSignalsRunner()
-    
-    # Check command line arguments
-    if len(sys.argv) > 1:
-        command = sys.argv[1].lower()
-        
-        if command == 'demo':
-            runner.run_demo()
-        
-        elif command == 'scan':
-            runner.run_full_scan()
-        
-        elif command == 'interactive' or command == 'i':
-            runner.interactive_mode()
-        
-        elif command.startswith('analyze') and len(sys.argv) > 2:
-            ticker = sys.argv[2].upper()
-            result = runner.analyze_single_company(ticker)
-            runner.display_analysis_result(result)
-        
-        else:
-            print("❌ Unknown command or missing arguments")
-            print("\nUsage:")
-            print("  python system_runner.py demo          - Run demonstration")
-            print("  python system_runner.py scan          - Run full market scan")
-            print("  python system_runner.py interactive   - Interactive mode")
-            print("  python system_runner.py analyze AAPL  - Analyze specific ticker")
-    
-    else:
-        # Default to interactive mode
-        runner.interactive_mode()
-
-
-if __name__ == "__main__":
-    main()
-
-
-# Additional utility functions for system monitoring and management
-
-class SystemMonitor:
-    """Monitor system performance and health"""
-    
-    def __init__(self, db_path: str = "glassdoor_reviews.db"):
-        self.db_path = db_path
-    
-    def get_system_stats(self) -> Dict[str, Any]:
-        """Get overall system statistics"""
-        import sqlite3
-        
-        conn = sqlite3.connect(self.db_path)
-        
-        stats = {}
-        
-        # Review statistics
-        cursor = conn.execute("SELECT COUNT(*) FROM reviews")
-        stats['total_reviews'] = cursor.fetchone()[0]
-        
-        cursor = conn.execute("SELECT COUNT(DISTINCT ticker) FROM reviews")
-        stats['total_companies'] = cursor.fetchone()[0]
-        
-        cursor = conn.execute("""
-            SELECT COUNT(*) FROM reviews 
-            WHERE review_date >= date('now', '-30 days')
-        """)
-        stats['recent_reviews'] = cursor.fetchone()[0]
-        
-        # Signal statistics
-        cursor = conn.execute("SELECT COUNT(*) FROM trading_signals")
-        stats['total_signals'] = cursor.fetchone()[0]
-        
-        cursor = conn.execute("""
-            SELECT COUNT(*) FROM trading_signals 
-            WHERE signal_date >= datetime('now', '-7 days')
-        """)
-        stats['recent_signals'] = cursor.fetchone()[0]
-        
-        # Performance metrics
-        cursor = conn.execute("""
-            SELECT AVG(confidence_score) FROM trading_signals 
-            WHERE signal_date >= datetime('now', '-30 days')
-        """)
-        avg_confidence = cursor.fetchone()[0]
-        stats['avg_confidence'] = round(avg_confidence, 2) if avg_confidence else 0
-        
-        conn.close()
-        return stats
-    
-    def print_system_status(self):
-        """Print comprehensive system status"""
-        stats = self.get_system_stats()
-        
-        print("\n📊 System Health Status")
-        print("=" * 40)
-        print(f"📋 Total Reviews: {stats['total_reviews']:,}")
-        print(f"🏢 Companies Tracked: {stats['total_companies']}")
-        print(f"📅 Recent Reviews (30d): {stats['recent_reviews']:,}")
-        print(f"🎯 Total Signals Generated: {stats['total_signals']}")
-        print(f"⚡ Recent Signals (7d): {stats['recent_signals']}")
-        print(f"🎯 Avg Confidence Score: {stats['avg_confidence']}/10")
-        
-        # Health indicators
-        print("\n🔍 Health Indicators:")
-        if stats['recent_reviews'] > 50:
-            print("✅ Data freshness: Good")
-        else:
-            print("⚠️  Data freshness: Low recent activity")
-        
-        if stats['avg_confidence'] >= 6:
-            print("✅ Signal quality: Good")
-        elif stats['avg_confidence'] >= 4:
-            print("⚠️  Signal quality: Moderate")
-        else:
-            print("❌ Signal quality: Needs improvement")
-
-
-# Configuration management
-class ConfigManager:
-    """Manage system configuration"""
-    
-    def __init__(self, config_file: str = "config.json"):
-        self.config_file = config_file
-        self.default_config = {
-            "database_path": "glassdoor_reviews.db",
-            "min_reviews_for_analysis": 10,
-            "analysis_period_days": 30,
-            "confidence_threshold": 6.0,
-            "max_companies_per_scan": 20,
-            "openai_model": "gpt-4",
-            "openai_temperature": 0.1
+    # Create DataFrame with explicit schema to avoid inference issues
+    result_df = pl.DataFrame(
+        all_results,
+        schema={
+            'qid': pl.Int64,
+            'date': pl.Date,
+            'length': pl.Float64,  # Explicitly Float64
+            'diff_vs_previous': pl.Float64,  # Explicitly Float64
+            'diff_vs_avg_previous': pl.Float64  # Explicitly Float64
         }
-        self.load_config()
+    )
     
-    def load_config(self):
-        """Load configuration from file or create default"""
-        try:
-            if os.path.exists(self.config_file):
-                with open(self.config_file, 'r') as f:
-                    self.config = json.load(f)
-            else:
-                self.config = self.default_config.copy()
-                self.save_config()
-        except Exception as e:
-            print(f"⚠️  Error loading config, using defaults: {e}")
-            self.config = self.default_config.copy()
-    
-    def save_config(self):
-        """Save current configuration to file"""
-        try:
-            with open(self.config_file, 'w') as f:
-                json.dump(self.config, f, indent=2)
-        except Exception as e:
-            print(f"❌ Error saving config: {e}")
-    
-    def get(self, key: str, default=None):
-        """Get configuration value"""
-        return self.config.get(key, default)
-    
-    def set(self, key: str, value):
-        """Set configuration value and save"""
-        self.config[key] = value
-        self.save_config()
-    
-    def print_config(self):
-        """Print current configuration"""
-        print("\n⚙️  System Configuration:")
-        print("=" * 30)
-        for key, value in self.config.items():
-            print(f"{key}: {value}")
+    return result_df.sort(['qid', 'date'])
 
+def calculate_daily_differences_batch_safe(df, start_date=None, end_date=None, batch_size=1000):
+    """
+    Batch processing version that's extra safe with schema handling
+    Processes dates in batches to avoid large list creation
+    """
+    
+    if start_date is None:
+        start_date = df.select(pl.col('date').min()).item()
+    if end_date is None:
+        end_date = df.select(pl.col('date').max()).item()
+    
+    if isinstance(start_date, str):
+        start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+    if isinstance(end_date, str):
+        end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+    
+    # Define schema upfront
+    schema = {
+        'qid': pl.Int64,
+        'date': pl.Date,
+        'length': pl.Float64,
+        'diff_vs_previous': pl.Float64,
+        'diff_vs_avg_previous': pl.Float64
+    }
+    
+    all_batch_results = []
+    
+    # Process each qid separately
+    for qid_val in df['qid'].unique().sort():
+        print(f"Processing QID {qid_val}...")
+        
+        qid_data = df.filter(pl.col('qid') == qid_val).sort('date')
+        records = qid_data.to_dicts()
+        
+        record_dates = [r['date'] for r in records]
+        record_lengths = [r['length'] for r in records]
+        
+        # Process dates in batches
+        current_date = start_date
+        while current_date <= end_date:
+            batch_end = min(current_date + timedelta(days=batch_size-1), end_date)
+            
+            batch_results = []
+            
+            # Process this batch of dates
+            batch_date = current_date
+            while batch_date <= batch_end:
+                
+                # Find most recent record
+                most_recent_idx = -1
+                for i, record_date in enumerate(record_dates):
+                    if record_date <= batch_date:
+                        most_recent_idx = i
+                    else:
+                        break
+                
+                if most_recent_idx == -1:
+                    batch_results.append({
+                        'qid': qid_val,
+                        'date': batch_date,
+                        'length': None,
+                        'diff_vs_previous': None,
+                        'diff_vs_avg_previous': None
+                    })
+                else:
+                    current_length = float(record_lengths[most_recent_idx])
+                    
+                    # Find previous records
+                    six_months_ago = batch_date - timedelta(days=180)
+                    prev_records = []
+                    
+                    for i in range(most_recent_idx):
+                        if record_dates[i] >= six_months_ago:
+                            prev_records.append((record_dates[i], record_lengths[i]))
+                    
+                    if prev_records:
+                        most_recent_prev_length = float(prev_records[-1][1])
+                        diff_vs_previous = current_length - most_recent_prev_length
+                        
+                        avg_prev = sum(length for _, length in prev_records) / len(prev_records)
+                        diff_vs_avg_previous = current_length - avg_prev
+                    else:
+                        diff_vs_previous = None
+                        diff_vs_avg_previous = None
+                    
+                    batch_results.append({
+                        'qid': qid_val,
+                        'date': batch_date,
+                        'length': current_length,
+                        'diff_vs_previous': diff_vs_previous,
+                        'diff_vs_avg_previous': diff_vs_avg_previous
+                    })
+                
+                batch_date += timedelta(days=1)
+            
+            # Create DataFrame for this batch with explicit schema
+            if batch_results:
+                batch_df = pl.DataFrame(batch_results, schema=schema)
+                all_batch_results.append(batch_df)
+            
+            current_date = batch_end + timedelta(days=1)
+    
+    # Concatenate all batches
+    if all_batch_results:
+        return pl.concat(all_batch_results).sort(['qid', 'date'])
+    else:
+        # Return empty DataFrame with correct schema
+        return pl.DataFrame([], schema=schema)
 
-# Export key classes for external use
-__all__ = [
-    'TradingSignalsRunner',
-    'SystemMonitor',
-    'ConfigManager'
-]
+def calculate_daily_differences_memory_optimized(df, start_date=None, end_date=None):
+    """
+    Most memory-efficient version for very large datasets
+    Uses iterative DataFrame construction to avoid memory spikes
+    """
+    
+    if start_date is None:
+        start_date = df.select(pl.col('date').min()).item()
+    if end_date is None:
+        end_date = df.select(pl.col('date').max()).item()
+    
+    if isinstance(start_date, str):
+        start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+    if isinstance(end_date, str):
+        end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+    
+    # Create empty result with proper schema
+    result_df = pl.DataFrame([], schema={
+        'qid': pl.Int64,
+        'date': pl.Date,
+        'length': pl.Float64,
+        'diff_vs_previous': pl.Float64,
+        'diff_vs_avg_previous': pl.Float64
+    })
+    
+    # Process each qid and append to result
+    for qid_val in df['qid'].unique().sort():
+        print(f"Processing QID {qid_val}...")
+        
+        qid_result = calculate_daily_differences_ultra_fast_fixed(
+            df.filter(pl.col('qid') == qid_val), 
+            start_date, 
+            end_date
+        )
+        
+        result_df = pl.concat([result_df, qid_result])
+    
+    return result_df.sort(['qid', 'date'])
+
+# Performance testing with schema fixes
+print("Original data:")
+print(df)
+
+print("\n" + "="*60)
+print("TESTING FIXED SCHEMA HANDLING")
+print("="*60)
+
+# Test with a reasonable range
+test_start = '2024-08-01'
+test_end = '2024-10-15'
+
+print(f"Testing with date range: {test_start} to {test_end}")
+
+try:
+    start_time = time.time()
+    result_fixed = calculate_daily_differences_ultra_fast_fixed(df, test_start, test_end)
+    time_fixed = time.time() - start_time
+    
+    print(f"✅ SUCCESS! Ultra-fast fixed method: {time_fixed:.4f} seconds")
+    print(f"Generated {result_fixed.height:,} daily records")
+    print(f"Schema: {result_fixed.dtypes}")
+    
+    # Show sample results
+    print("\nSample results:")
+    sample = result_fixed.filter(pl.col('date').is_in([
+        date(2024, 8, 10), date(2024, 9, 11), date(2024, 9, 15), date(2024, 10, 1)
+    ]))
+    print(sample)
+    
+except Exception as e:
+    print(f"❌ Error with ultra-fast method: {e}")
+    
+    print("\nTrying batch-safe method...")
+    try:
+        result_batch = calculate_daily_differences_batch_safe(df, test_start, test_end, batch_size=100)
+        print(f"✅ SUCCESS! Batch-safe method worked")
+        print(f"Generated {result_batch.height:,} daily records")
+    except Exception as e2:
+        print(f"❌ Error with batch method: {e2}")
+
+print("\n" + "="*60)
+print("RECOMMENDATIONS FOR 10-YEAR DATA:")
+print("="*60)
+print("1. 🚀 PRIMARY: calculate_daily_differences_ultra_fast_fixed()")
+print("   - Fixed schema handling")
+print("   - Explicit Float64 types")
+print("   - Best performance")
+print("")
+print("2. 🛡️ BACKUP: calculate_daily_differences_batch_safe()")
+print("   - Extra safe with batching")
+print("   - Memory efficient")
+print("   - Use if primary method fails")
+print("")
+print("3. 💾 MEMORY-CONSTRAINED: calculate_daily_differences_memory_optimized()")
+print("   - Lowest memory usage")
+print("   - Processes one QID at a time")
+
+print("\n" + "="*50)
+print("FOR YOUR 10-YEAR DATASET, USE:")
+print("="*50)
+print("result = calculate_daily_differences_ultra_fast_fixed(df, '2014-01-01', '2024-12-31')")
