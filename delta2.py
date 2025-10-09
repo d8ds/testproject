@@ -91,3 +91,25 @@ def get_signals_for_backtest(signal_events: pl.DataFrame,
         by="qid",
         strategy="backward"
     )
+#========
+# 公司A的filing历史
+# 2023-01-01: 100
+# 2023-04-01: 120  (90天后)
+# 2023-10-01: 110  (183天后)
+
+# Signal时间线：
+# 2023-01-01: None (只有1个filing)
+# 2023-04-01: 120-100=20 (现在有2个filing)
+# 2023-07-01: None (2023-01-01的filing退出窗口，只剩1个)
+# 2023-10-01: 110-120=-10 (新filing进入)
+# 2024-04-02: None (2023-04-01的filing退出窗口)
+
+test_case = pl.DataFrame({
+    "qid": ["A", "A", "A"],
+    "document_id": ["d1", "d2", "d3"],
+    "length": [100, 120, 110],
+    "date": ["2023-01-01", "2023-04-01", "2023-10-01"]
+})
+
+events = compute_complete_signal_events(test_case, lookback_days=180)
+print(events)
