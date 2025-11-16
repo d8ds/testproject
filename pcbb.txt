@@ -1,449 +1,183 @@
+Excellent question! Your signals naturally form a hierarchical narrative from surface-level to deep behavioral patterns. Here's how to organize them into a compelling story:
 
-import polars as pl
-import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.decomposition import PCA
-from datetime import datetime, timedelta
-import pandas as pd
-from typing import Dict, List, Tuple, Optional
+Narrative Framework: "Peeling the Onion"
+The story arc moves from what's visible → what's meaningful → what's hidden → what reveals true behavior
 
-class TfIdfPCAAnalyzer:
-    def __init__(self, n_components: int = 10, max_features: int = 1000):
-        """
-        Initialize the TF-IDF PCA analyzer.
-        
-        Args:
-            n_components: Number of PCA components to keep
-            max_features: Maximum number of features for TF-IDF vectorizer
-        """
-        self.n_components = n_components
-        self.max_features = max_features
-        
-    def prepare_data(self, df: pl.DataFrame) -> pl.DataFrame:
-        """
-        Prepare the dataframe by ensuring proper date format and sorting.
-        """
-        return (df
-                .with_columns([
-                    pl.col("date").str.to_date() if df["date"].dtype == pl.Utf8 else pl.col("date")
-                ])
-                .sort(["qid", "date", "document_id", "sentence_id"])
-               )
-    
-    def get_text_by_qid_date_window(self, df: pl.DataFrame, target_date: datetime, 
-                                   lookback_months: int = 6, min_date: datetime = None) -> Tuple[Dict[str, str], int]:
-        """
-        Get concatenated text for each qid within the lookback window.
-        
-        Args:
-            df: Polars dataframe
-            target_date: The date to look back from
-            lookback_months: Number of months to look back (preferred window)
-            min_date: Minimum date in dataset (to avoid going before data exists)
-            
-        Returns:
-            Tuple of (Dictionary mapping qid to concatenated text, actual window days used)
-        """
-        # Calculate the preferred start date for the window
-        preferred_start_date = target_date - timedelta(days=lookback_months * 30)  # Approximate
-        
-        # Use the later of preferred start date or min_date (if available data is shorter)
-        if min_date is not None:
-            actual_start_date = max(preferred_start_date, min_date)
-        else:
-            actual_start_date = preferred_start_date
-        
-        # Calculate actual window size in days
-        actual_window_days = (target_date - actual_start_date).days + 1
-        
-        # Filter data within the window
-        window_data = df.filter(
-            (pl.col("date") >= actual_start_date) & 
-            (pl.col("date") <= target_date)
-        )
-        
-        # Group by qid and concatenate all sentences
-        if window_data.height == 0:
-            return {}, 0
-        
-        qid_texts = (window_data
-                    .group_by("qid")
-                    .agg(pl.col("sentence").str.concat(" "))
-                    .to_dict(as_series=False)
-                    )
-        
-        return dict(zip(qid_texts["qid"], qid_texts["sentence"])), actual_window_days
-    
-    def compute_tfidf_pca(self, texts: Dict[str, str]) -> Tuple[np.ndarray, TfidfVectorizer, PCA, List[str]]:
-        """
-        Compute TF-IDF matrix and apply PCA.
-        
-        Args:
-            texts: Dictionary mapping qid to text
-            
-        Returns:
-            Tuple of (PCA transformed data, fitted vectorizer, fitted PCA, list of qids)
-        """
-        if not texts:
-            return np.array([]), None, None, []
-        
-        qids = list(texts.keys())
-        documents = list(texts.values())
-        
-        # Compute TF-IDF
-        vectorizer = TfidfVectorizer(
-            max_features=self.max_features,
-            stop_words='english',
-            ngram_range=(1, 2),
-            min_df=2,
-            max_df=0.95
-        )
-        
-        try:
-            tfidf_matrix = vectorizer.fit_transform(documents)
-            
-            # Apply PCA
-            n_components = min(self.n_components, tfidf_matrix.shape[0] - 1, tfidf_matrix.shape[1])
-            pca = PCA(n_components=n_components)
-            pca_result = pca.fit_transform(tfidf_matrix.toarray())
-            
-            return pca_result, vectorizer, pca, qids
-            
-        except Exception as e:
-            print(f"Error in TF-IDF/PCA computation: {e}")
-            return np.array([]), None, None, qids
-    
-    def generate_date_range(self, df: pl.DataFrame) -> List[datetime]:
-        """
-        Generate complete date range for analysis from min to max date.
-        
-        Args:
-            df: Polars dataframe
-            
-        Returns:
-            List of all dates to analyze
-        """
-        df = self.prepare_data(df)
-        min_date = df["date"].min()
-        max_date = df["date"].max()
-        
-        # Generate all dates from min to max (inclusive)
-        current_date = min_date
-        dates = []
-        
-        while current_date <= max_date:
-            dates.append(current_date)
-            current_date += timedelta(days=1)
-        
-        return dates
-    
-    def analyze_all_dates(self, df: pl.DataFrame, lookback_months: int = 6, 
-                         daily: bool = True) -> Dict[datetime, Dict]:
-        """
-        Perform PCA analysis for each date (daily or just document dates).
-        Uses all available data within the lookback window, even if less than the full period.
-        
-        Args:
-            df: Polars dataframe
-            lookback_months: Number of months to look back (preferred window)
-            daily: If True, analyze every day; if False, only analyze days with documents
-            
-        Returns:
-            Dictionary mapping dates to analysis results
-        """
-        df = self.prepare_data(df)
-        min_date = df["date"].min()
-        max_date = df["date"].max()
-        
-        if daily:
-            # Generate complete date range from min to max
-            analysis_dates = self.generate_date_range(df)
-            print(f"Analyzing {len(analysis_dates)} days (daily analysis from {min_date} to {max_date})")
-        else:
-            # Only analyze dates that have documents
-            analysis_dates = sorted(df["date"].unique().to_list())
-            print(f"Analyzing {len(analysis_dates)} document dates")
-        
-        results = {}
-        
-        for i, date in enumerate(analysis_dates):
-            if i % 30 == 0 or i == len(analysis_dates) - 1:  # Progress every 30 days
-                print(f"Processing date {i+1}/{len(analysis_dates)}: {date}")
-            
-            # Get texts for this date's window (using all available data up to lookback_months)
-            texts, actual_window_days = self.get_text_by_qid_date_window(
-                df, date, lookback_months, min_date
-            )
-            
-            if len(texts) < 2:
-                # Store empty result but continue
-                results[date] = {
-                    'pca_components': np.array([]),
-                    'qids': [],
-                    'explained_variance_ratio': None,
-                    'feature_names': None,
-                    'n_features': 0,
-                    'n_qids': 0,
-                    'window_days': actual_window_days,
-                    'status': 'insufficient_data'
-                }
-                continue
-            
-            # Compute TF-IDF and PCA
-            pca_result, vectorizer, pca, qids = self.compute_tfidf_pca(texts)
-            
-            if pca_result.size == 0:
-                results[date] = {
-                    'pca_components': np.array([]),
-                    'qids': qids,
-                    'explained_variance_ratio': None,
-                    'feature_names': None,
-                    'n_features': 0,
-                    'n_qids': len(qids),
-                    'window_days': actual_window_days,
-                    'status': 'pca_failed'
-                }
-                continue
-            
-            # Store results
-            results[date] = {
-                'pca_components': pca_result,
-                'qids': qids,
-                'explained_variance_ratio': pca.explained_variance_ratio_ if pca else None,
-                'feature_names': vectorizer.get_feature_names_out() if vectorizer else None,
-                'n_features': len(vectorizer.get_feature_names_out()) if vectorizer else 0,
-                'n_qids': len(qids),
-                'window_days': actual_window_days,
-                'status': 'success'
-            }
-        
-        # Print summary
-        successful = sum(1 for r in results.values() if r['status'] == 'success')
-        insufficient = sum(1 for r in results.values() if r['status'] == 'insufficient_data')
-        failed = sum(1 for r in results.values() if r['status'] == 'pca_failed')
-        
-        print(f"\nAnalysis complete:")
-        print(f"  Total dates analyzed: {len(results)}")
-        print(f"  Successful: {successful}")
-        print(f"  Insufficient data: {insufficient}")
-        print(f"  PCA failed: {failed}")
-        
-        # Show window size statistics for successful analyses
-        if successful > 0:
-            window_days = [r['window_days'] for r in results.values() if r['status'] == 'success']
-            print(f"  Window size stats (successful analyses):")
-            print(f"    Min window: {min(window_days)} days")
-            print(f"    Max window: {max(window_days)} days") 
-            print(f"    Avg window: {sum(window_days)/len(window_days):.1f} days")
-            print(f"    Target window: {lookback_months * 30} days")
-        
-        return results
-    
-    def get_pca_dataframe(self, results: Dict[datetime, Dict]) -> pl.DataFrame:
-        """
-        Convert PCA results to a Polars dataframe for easy analysis.
-        
-        Args:
-            results: Results from analyze_all_dates
-            
-        Returns:
-            Polars dataframe with PCA components for each qid and date
-        """
-        rows = []
-        
-        for date, result in results.items():
-            pca_components = result['pca_components']
-            qids = result['qids']
-            status = result['status']
-            
-            if status != 'success' or pca_components.size == 0:
-                # Add row with null values for failed dates
-                rows.append({
-                    'date': date,
-                    'qid': None,
-                    'status': status,
-                    'n_qids': result['n_qids']
-                })
-                continue
-            
-            for i, qid in enumerate(qids):
-                row = {
-                    'date': date,
-                    'qid': qid,
-                    'status': status,
-                    'n_qids': result['n_qids']
-                }
-                
-                # Add PCA components as separate columns
-                for j in range(pca_components.shape[1]):
-                    row[f'pc_{j+1}'] = pca_components[i, j]
-                
-                rows.append(row)
-        
-        return pl.DataFrame(rows)
+Act 1: Surface Level - "What We See First"
+Signal 1: Document Length (Context)
+The Starting Point
+Slide Title: "The Obvious Signal: Document Length"
+The Intuition:
 
-    def get_analysis_summary(self, results: Dict[datetime, Dict]) -> pl.DataFrame:
-        """
-        Get a summary dataframe showing data availability and success rates by date.
-        
-        Args:
-            results: Results from analyze_all_dates
-            
-        Returns:
-            Summary dataframe with date, status, n_qids, n_features, window_days
-        """
-        summary_rows = []
-        
-        for date, result in results.items():
-            summary_rows.append({
-                'date': date,
-                'status': result['status'],
-                'n_qids': result['n_qids'],
-                'n_features': result['n_features'],
-                'window_days': result.get('window_days', 0),
-                'explained_variance_sum': sum(result['explained_variance_ratio']) if result['explained_variance_ratio'] is not None else None
-            })
-        
-        return pl.DataFrame(summary_rows)
+Longer 8-Ks suggest complexity, uncertainty, or attempting to bury bad news
+Shorter 8-Ks suggest straightforward events or management confidence
+
+Show Results:
+
+Basic performance metrics (probably modest IC ~0.02-0.03)
+Quintile analysis showing some spread
+
+The Problem (Plant the Seed):
+"But wait—not all words are created equal. A 5,000-word filing could be:
+
+Dense with meaningful information, OR
+Padded with boilerplate and legal jargon"
+
+The Transition: "So we asked: What if we filter for quality?"
+
+Act 2: Content Quality - "Separating Signal from Noise"
+Signal 2: Filtered Length (Content)
+The Refinement
+Slide Title: "Beyond Word Count: Quality-Adjusted Length"
+The Method:
+
+Sentence quality filtering (remove boilerplate, legal disclaimers, low-information sentences)
+Focus on substantive content only
+
+The Reveal:
+
+Show side-by-side performance: Raw length vs Filtered length
+Demonstrate improvement (IC improvement from 0.02 → 0.04, for example)
+"Filtering noise improved signal quality by 2x"
+
+The Insight:
+
+"Management can inflate word count easily. But they can't fake substantive content. Quality-adjusted length reveals information density, not just verbosity."
+
+The Bridge to Next Level:
+"But even quality content can be organized differently. How information is structured matters..."
+
+Act 3: Structural Complexity - "How Information is Organized"
+Signal 3: Section/Item Count (Finer-Grained Info)
+The Architectural View
+Slide Title: "Document Architecture: Section Complexity as Signal"
+The Concept:
+
+Number of sections/items disclosed
+Structural complexity vs simplicity
+Information organization reveals cognitive load or obfuscation intent
+
+The Hypotheses:
+
+More sections = Multiple simultaneous events OR attempting to fragment attention
+Fewer sections = Focused disclosure OR cleaner event
+Section diversity = Cross-sectional complexity in business changes
+
+Show Results:
+
+Performance metrics
+Maybe show interaction effects: "Long documents with few sections" vs "Long documents with many sections"
+
+The Key Finding:
+
+"Two companies file the same length document. One uses 3 sections, one uses 8. The 8-section filer underperforms by 40bps over the next month. Why? Structural complexity signals information uncertainty or deliberate obfuscation."
+
+The Transition:
+"So far we've analyzed what they file and how they structure it. But there's another dimension: when they file..."
+
+Act 4: Behavioral Metadata - "What They Don't Say Directly"
+Signal 4: Filing Delay (Meta Data)
+The Behavioral Reveal
+Slide Title: "The Delay Signal: When Silence Speaks"
+The Setup:
+
+4-day deadline for 8-K filing
+Management chooses when within that window to file
+Delay = time from event to filing
+
+The Behavioral Interpretation:
+Fast filing (Day 0-1):
+
+Confidence in message
+Desire for rapid disclosure
+Positive or neutral news
+
+Slow filing (Day 3-4):
+
+Need for careful wording
+Legal/PR consultation
+Negative or complex news
+
+Show the Performance:
+
+Quintile analysis by delay
+Probably strong monotonic relationship
+Maybe show that delay predicts both direction AND magnitude of price movement
+
+The Power:
+
+"This is pure behavioral signal. Management reveals their confidence (or lack thereof) through their actions, not their words. Delay is the ultimate truth serum—it's much harder to fake than text."
+
+Additional Insight (if applicable):
+
+Combine with day-of-week patterns (Friday evening filings = bad news burial)
+Interaction with market conditions (delaying during earnings season)
 
 
-def generate_large_test_dataset(n_qids=500, n_docs_per_qid=20, n_sentences_per_doc=15):
-    """Generate a larger, more realistic dataset for testing"""
-    
-    import random
-    from datetime import datetime, timedelta
-    
-    # Financial text templates for more realistic content
-    financial_templates = [
-        "Revenue increased by {percent}% compared to previous quarter due to {reason}",
-        "Operating expenses were {trend} by {amount} million primarily from {category}",
-        "Net income for the quarter was ${amount} million, {comparison} than expected",
-        "Cash flow from operations {trend} to ${amount} million this period",
-        "Total assets reached ${amount} billion, representing {growth}% growth",
-        "Debt-to-equity ratio {trend} to {ratio}, indicating {assessment} financial position",
-        "Market share in {sector} segment {trend} by {percent} percentage points",
-        "Investment in {category} totaled ${amount} million during the quarter",
-        "Risk-adjusted returns were {performance} expectations at {percent}%",
-        "Regulatory compliance costs {trend} by ${amount} million year-over-year",
-        "Customer acquisition costs {trend} while retention rates {improvement}",
-        "Digital transformation initiatives generated ${amount} million in savings",
-        "Supply chain disruptions resulted in {impact} of approximately ${amount} million",
-        "ESG initiatives contributed to {metric} improvement of {percent}%",
-        "Research and development spending {trend} to ${amount} million this quarter"
-    ]
-    
-    # Words/phrases to fill templates
-    fill_words = {
-        'percent': [5, 8, 12, 15, 18, 22, 25, 30, 35, 40],
-        'amount': [10, 25, 50, 75, 100, 150, 200, 300, 500, 750, 1000],
-        'ratio': [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.5],
-        'reason': ['strong demand', 'market expansion', 'new product launches', 'cost optimization', 'strategic acquisitions'],
-        'trend': ['increased', 'decreased', 'improved', 'declined', 'stabilized'],
-        'comparison': ['higher', 'lower', 'consistent', 'better', 'worse'],
-        'category': ['personnel', 'technology', 'marketing', 'operations', 'infrastructure'],
-        'sector': ['retail', 'healthcare', 'technology', 'manufacturing', 'financial services'],
-        'growth': [5, 8, 10, 12, 15, 18, 20, 25, 30],
-        'assessment': ['strong', 'stable', 'improving', 'concerning', 'healthy'],
-        'performance': ['above', 'below', 'meeting', 'exceeding'],
-        'impact': ['an impact', 'losses', 'delays', 'additional costs'],
-        'improvement': ['improved', 'remained stable', 'showed gains'],
-        'metric': ['efficiency', 'sustainability', 'transparency', 'governance']
-    }
+Act 5: The Integration - "From Individual Signals to Behavioral Fingerprint"
+Signal 5: The Composite Story
+Bringing It All Together
+Slide Title: "Four Dimensions of Disclosure Behavior"
+Visual: A Framework Diagram
+DISCLOSURE BEHAVIOR FINGERPRINT
 
-    def generate_realistic_text():
-        """Generate realistic financial text"""
-        template = random.choice(financial_templates)
-        filled_template = template
-        
-        for key, values in fill_words.items():
-            if '{' + key + '}' in template:
-                filled_template = filled_template.replace('{' + key + '}', str(random.choice(values)))
-        
-        return filled_template
-    
-    print(f"Generating dataset with {n_qids} qids, {n_docs_per_qid} docs per qid, {n_sentences_per_doc} sentences per doc...")
-    print(f"Expected total records: {n_qids * n_docs_per_qid * n_sentences_per_doc:,}")
-    
-    data_records = []
-    base_date = datetime(2023, 1, 1)
-    
-    for qid_idx in range(n_qids):
-        qid = f"QID_{qid_idx:04d}"
-        
-        # Generate filing dates spanning 18 months (to test 6-month filtering)
-        qid_dates = []
-        for doc_idx in range(n_docs_per_qid):
-            # Random date within 18 months, with some clustering
-            days_offset = random.randint(0, 540)  # 18 months
-            filing_date = base_date + timedelta(days=days_offset)
-            qid_dates.append(filing_date.strftime('%Y-%m-%d'))
-        
-        # Create documents for this qid
-        for doc_idx in range(n_docs_per_qid):
-            doc_id = f"DOC_{qid_idx:04d}_{doc_idx:03d}"
-            filing_date = qid_dates[doc_idx]
-            
-            # Generate sentences for this document
-            for sent_idx in range(n_sentences_per_doc):
-                sentence_id = sent_idx + 1
-                text = generate_realistic_text()
-                
-                data_records.append({
-                    'qid': qid,
-                    'document_id': doc_id,
-                    'sentence_id': sentence_id,
-                    'date': filing_date,
-                    'sentence': text
-                })
-        
-        # Progress indicator
-        if (qid_idx + 1) % 50 == 0:
-            print(f"Generated data for {qid_idx + 1}/{n_qids} qids...")
-    
-    print(f"Dataset generation complete. Total records: {len(data_records):,}")
-    syn_data = pl.DataFrame(data_records)
-    print(f"Data samples:\n {syn_data.head()}")
-    return syn_data
+Surface Layer:        Volume (Length)
+                           ↓
+Content Layer:        Quality (Filtered Length)  
+                           ↓
+Structural Layer:     Complexity (Section Count)
+                           ↓
+Behavioral Layer:     Timing (Filing Delay)
+The Integration Hypothesis:
+"These signals capture orthogonal dimensions of management behavior"
+Show Correlation Matrix:
+                Length  Filtered  Sections  Delay
+Length           1.00    0.75      0.35     0.15
+Filtered         0.75    1.00      0.28     0.12
+Sections         0.35    0.28      1.00     0.08
+Delay            0.15    0.12      0.08     1.00
+The Key Insight:
 
-# Example usage
-def main():
-    # Example: Create sample data (replace with your actual data loading)
-    """
-    # Load your data
-    df = pl.read_csv("your_data.csv")
-    # or
-    df = pl.DataFrame({
-        'qid': [...],
-        'date': [...],
-        'document_id': [...],
-        'sentence_id': [...],
-        'sentence': [...]
-    })
-    """
-    df = generate_large_test_dataset(n_qids=50, n_docs_per_qid=10, n_sentences_per_doc=8)
-    df = df.sort(["date", "qid"])
-    df.write_csv('data.csv')
-    print(df)
-    # Initialize analyzer
-    analyzer = TfIdfPCAAnalyzer(n_components=2, max_features=1000)
-    
-    # Run analysis
-    results = analyzer.analyze_all_dates(df, lookback_months=6)
-    
-    # Convert to dataframe for further analysis
-    pca_df = analyzer.get_pca_dataframe(results)
-    
-    # Print summary
-    print(f"Processed {len(results)} dates")
-    print(f"PCA dataframe shape: {pca_df.shape}")
-    print(f"Columns: {pca_df.columns}")
-    print(pca_df)
-    # Example: Access results for a specific date
-    # specific_date = list(results.keys())[0]
-    # print(f"\nResults for {specific_date}:")
-    # print(f"  Number of QIDs: {results[specific_date]['n_qids']}")
-    # print(f"  Number of features: {results[specific_date]['n_features']}")
-    # print(f"  Explained variance ratio: {results[specific_date]['explained_variance_ratio'][:5]}")
+"Low correlation means each signal adds unique information. A company can file quickly (low delay) but use complex structure (high sections)—each tells us something different about their state."
 
-if __name__ == "__main__":
-    main()
+
+Act 6: Point vs Delta vs Rolling - The Temporal Dimension
+Slide Title: "From Events to Patterns: The Aggregation Breakthrough"
+Now Apply Your Temporal Finding:
+For EACH signal type, show:
+
+Point-based (current filing only)
+Delta-based (change vs previous)
+Rolling-based (pattern over time)
+
+Create a Heat Map or Matrix:
+                    Point    Delta    Rolling
+Length              0.02     0.03     0.06
+Filtered Length     0.03     0.04     0.07
+Section Count       0.02     0.02     0.05
+Filing Delay        0.04     0.04     0.08
+(These are example ICs)
+The Universal Truth:
+
+"Across ALL signal types, rolling aggregation dominates. Why? Because we're not trading on single events—we're trading on management disclosure behavior, which is a persistent trait."
+
+The Examples:
+Point-based thinking:
+"This company filed late" → Noisy, could be one-off
+Delta-based thinking:
+"This company filed later than last time" → Better, but still reactive
+Rolling-based thinking:
+"This company has been consistently filing late for 6 months" → Pattern, behavioral trait
+
+The Complete Story Arc
+15-Minute Structure:
+
+Intro (2 min): Why 8-K, the opportunity
+Length Signal (2 min): The obvious starting point, modest results
+Quality Filter (2 min): Refinement improves performance, introduces content focus
+Structure Signal (2 min): Adding architectural dimension, orthogonal information
+Delay Signal (2.5 min): The behavioral reveal, strongest standalone signal
+Integration (2 min): How signals combine, correlation matrix, composite performance
+Point vs Rolling (3 min): The methodological breakthrough that lifts everything
+Results & Next Steps (1.5 min): Final performance, takeaways
+
