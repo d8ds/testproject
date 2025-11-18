@@ -1,275 +1,306 @@
-import polars as pl
-import numpy as np
-from scipy.stats import entropy
-import pandas as pd
+Excellent idea! This adds credibility and shows intellectual honesty. Here are several options:
 
-def calculate_rolling_entropy_safe(df, window_months=12):
-    """
-    Calculate rolling entropy without lookahead bias using pandas for rolling operations
-    """
-    
-    # Step 1: Create monthly filing counts
-    monthly_data = (
-        df.with_columns([
-            pl.col('filing_date').dt.truncate('1mo').alias('month')
-        ])
-        .group_by(['qid', 'month'])
-        .agg([
-            pl.col('document_id').n_unique().alias('monthly_filings')
-        ])
-        .sort(['qid', 'month'])
-    )
-    
-    # Convert to pandas for rolling operations (Polars rolling_map has limitations)
-    monthly_pd = monthly_data.to_pandas()
-    monthly_pd['month'] = pd.to_datetime(monthly_pd['month'])
-    monthly_pd = monthly_pd.set_index('month')
-    
-    def safe_entropy(values):
-        """Calculate entropy safely"""
-        # Remove NaN values
-        values = values.dropna()
-        
-        if len(values) < 3:  # Need minimum data points
-            return np.nan
-        
-        if values.sum() == 0:
-            return 0.0
-        
-        # Convert to probabilities
-        probs = values / values.sum()
-        
-        # Remove zeros
-        probs = probs[probs > 0]
-        
-        if len(probs) <= 1:
-            return 0.0
-        
-        # Calculate entropy
-        return entropy(probs)
-    
-    # Calculate rolling features
-    result_list = []
-    
-    for qid in monthly_pd['qid'].unique():
-        qid_data = monthly_pd[monthly_pd['qid'] == qid].copy()
-        
-        # Calculate rolling entropy
-        qid_data['rolling_entropy'] = (
-            qid_data['monthly_filings']
-            .rolling(window=window_months, min_periods=6)
-            .apply(safe_entropy, raw=False)
-        )
-        
-        # Calculate other rolling features
-        qid_data['rolling_mean'] = (
-            qid_data['monthly_filings']
-            .rolling(window=window_months, min_periods=6)
-            .mean()
-        )
-        
-        qid_data['rolling_std'] = (
-            qid_data['monthly_filings']
-            .rolling(window=window_months, min_periods=6)
-            .std()
-        )
-        
-        # Calculate coefficient of variation
-        qid_data['rolling_cv'] = qid_data['rolling_std'] / qid_data['rolling_mean']
-        
-        result_list.append(qid_data.reset_index())
-    
-    # Combine results
-    all_results = pd.concat(result_list, ignore_index=True)
-    
-    # Convert back to polars
-    result_pl = pl.from_pandas(all_results)
-    
-    # Join back to original data
-    final_result = df.join(
-        result_pl.select(['qid', 'month', 'rolling_entropy', 'rolling_cv', 'rolling_mean']),
-        left_on=['qid', pl.col('filing_date').dt.truncate('1mo')],
-        right_on=['qid', 'month'],
-        how='left'
-    )
-    
-    return final_result
+---
 
+## **Option 1: "What Didn't Work" (Most Direct)**
 
-def calculate_entropy_features_vectorized(df, window_months=12):
-    """
-    Alternative approach using vectorized operations
-    """
-    
-    # Create monthly data
-    monthly_data = (
-        df.with_columns([
-            pl.col('filing_date').dt.truncate('1mo').alias('month')
-        ])
-        .group_by(['qid', 'month'])
-        .agg([
-            pl.col('document_id').n_unique().alias('monthly_filings')
-        ])
-        .sort(['qid', 'month'])
-    )
-    
-    # Add row numbers for each qid
-    monthly_data = monthly_data.with_columns([
-        pl.int_range(pl.len()).over('qid').alias('month_idx')
-    ])
-    
-    # Calculate rolling statistics using Polars built-in functions
-    rolling_features = (
-        monthly_data
-        .with_columns([
-            # Rolling mean
-            pl.col('monthly_filings')
-            .rolling_mean(window_size=window_months, min_periods=6)
-            .over('qid')
-            .alias('rolling_mean'),
-            
-            # Rolling std
-            pl.col('monthly_filings')
-            .rolling_std(window_size=window_months, min_periods=6)
-            .over('qid')
-            .alias('rolling_std'),
-            
-            # Rolling max
-            pl.col('monthly_filings')
-            .rolling_max(window_size=window_months, min_periods=6)
-            .over('qid')
-            .alias('rolling_max'),
-            
-            # Rolling min
-            pl.col('monthly_filings')
-            .rolling_min(window_size=window_months, min_periods=6)
-            .over('qid')
-            .alias('rolling_min'),
-        ])
-        .with_columns([
-            # Coefficient of variation
-            (pl.col('rolling_std') / pl.col('rolling_mean')).alias('rolling_cv'),
-            
-            # Range normalized by mean
-            ((pl.col('rolling_max') - pl.col('rolling_min')) / pl.col('rolling_mean')).alias('rolling_range_norm'),
-            
-            # Simple entropy proxy: 1 / CV (lower CV = higher consistency = lower entropy)
-            (1 / (pl.col('rolling_std') / pl.col('rolling_mean') + 0.01)).alias('consistency_score'),
-            
-            # Burst indicator: current vs rolling mean
-            (pl.col('monthly_filings') / pl.col('rolling_mean')).alias('burst_ratio')
-        ])
-    )
-    
-    # Join back to original data
-    result_df = df.join(
-        rolling_features.select([
-            'qid', 'month', 'rolling_cv', 'rolling_range_norm', 
-            'consistency_score', 'burst_ratio', 'rolling_mean'
-        ]),
-        left_on=['qid', pl.col('filing_date').dt.truncate('1mo')],
-        right_on=['qid', 'month'],
-        how='left'
-    )
-    
-    return result_df
+**Title:** "What Didn't Work: Lessons from Failed Signals"
 
+**Subtitle:** "Not every hypothesis panned out—here's what we learned"
 
-def calculate_true_rolling_entropy(df, window_months=12):
-    """
-    Calculate true entropy using a more manual approach that avoids Polars limitations
-    """
-    
-    # Create monthly data
-    monthly_data = (
-        df.with_columns([
-            pl.col('filing_date').dt.truncate('1mo').alias('month')
-        ])
-        .group_by(['qid', 'month'])
-        .agg([
-            pl.col('document_id').n_unique().alias('monthly_filings')
-        ])
-        .sort(['qid', 'month'])
-    )
-    
-    # Convert to list of dictionaries for manual processing
-    monthly_records = monthly_data.to_dicts()
-    
-    # Group by qid
-    qid_groups = {}
-    for record in monthly_records:
-        qid = record['qid']
-        if qid not in qid_groups:
-            qid_groups[qid] = []
-        qid_groups[qid].append(record)
-    
-    # Calculate rolling entropy for each qid
-    entropy_results = []
-    
-    for qid, records in qid_groups.items():
-        filings = [r['monthly_filings'] for r in records]
-        months = [r['month'] for r in records]
-        
-        for i in range(len(records)):
-            # Get window data (only historical)
-            start_idx = max(0, i - window_months + 1)
-            window_filings = filings[start_idx:i+1]
-            
-            if len(window_filings) >= 6:  # Minimum periods
-                # Calculate entropy
-                total = sum(window_filings)
-                if total > 0:
-                    probs = [f/total for f in window_filings if f > 0]
-                    if len(probs) > 1:
-                        ent = -sum(p * np.log(p) for p in probs)  # Manual entropy calculation
-                    else:
-                        ent = 0.0
-                else:
-                    ent = 0.0
-            else:
-                ent = np.nan
-            
-            entropy_results.append({
-                'qid': qid,
-                'month': months[i],
-                'rolling_entropy': ent,
-                'window_size': len(window_filings)
-            })
-    
-    # Convert back to polars
-    entropy_df = pl.DataFrame(entropy_results)
-    
-    # Join back to original data
-    result_df = df.join(
-        entropy_df.select(['qid', 'month', 'rolling_entropy']),
-        left_on=['qid', pl.col('filing_date').dt.truncate('1mo')],
-        right_on=['qid', 'month'],
-        how='left'
-    )
-    
-    return result_df
+**Content Structure:**
 
+| Signal Tested | Hypothesis | Why We Thought It Would Work | Result | Why It Failed |
+|---------------|------------|------------------------------|--------|---------------|
+| **Readability Scores** (Flesch-Kincaid, etc.) | Complex writing = obfuscation | Harder-to-read filings hide bad news | IC ≈ 0.00 | 8-Ks are already simple; little cross-sectional variation |
+| **Sentiment Analysis** (Basic tone) | Negative tone = bad news | Pessimistic language predicts returns | IC ≈ 0.01 | Management tone in 8-Ks is formulaic/neutral; limited signal |
+| **Filing Size (File KB)** | Large files = complexity | File size includes exhibits, complexity | IC ≈ 0.00 | Driven by PDF formatting, not content; noisy proxy |
+| **Word Diversity** (Unique words/Total words) | High diversity = substantive | Rich vocabulary indicates depth | IC ≈ -0.01 | Legal boilerplate has high diversity; inverse of intent |
+| **Average Sentence Length** | Long sentences = complexity | Verbose syntax signals uncertainty | IC ≈ 0.00 | No consistent pattern; too granular |
 
-# Example usage:
-if __name__ == "__main__":
-    # Sample data creation
-    sample_data = pl.DataFrame({
-        'qid': ['AAPL'] * 50 + ['MSFT'] * 50,
-        'document_id': [f'doc_{i}' for i in range(100)],
-        'sentence_id': list(range(100)),
-        'sentence_text': [f'text_{i}' for i in range(100)],
-        'filing_date': pl.date_range(
-            start=pl.date(2020, 1, 1),
-            end=pl.date(2024, 12, 31),
-            interval='1mo'
-        ).take(list(range(50)) * 2)
-    })
-    
-    # Test different methods
-    print("Testing vectorized approach (recommended):")
-    result1 = calculate_entropy_features_vectorized(sample_data)
-    print(result1.select(['qid', 'filing_date', 'rolling_cv', 'consistency_score']).head())
-    
-    print("\nTesting true entropy calculation:")
-    result2 = calculate_true_rolling_entropy(sample_data)
-    print(result2.select(['qid', 'filing_date', 'rolling_entropy']).head())
+**Key Learnings:**
+
+1. **Generic NLP metrics underperform domain-specific features**
+   - Readability and sentiment work better for 10-Ks (longer, more narrative)
+   - 8-Ks are too short and formulaic for these to differentiate
+
+2. **File-level metadata is too noisy**
+   - PDF compression, formatting choices dominate actual content signals
+   - Better to work with extracted text
+
+3. **Sophisticated ≠ Predictive**
+   - Word diversity seemed clever but had no economic intuition in retrospect
+   - Simpler, behavior-focused metrics (delay, length) outperformed
+
+**The Takeaway:**
+> "We tested many sophisticated NLP features. What worked best? Simple, interpretable metrics applied with rolling aggregation. **Methodology matters more than feature complexity.**"
+
+---
+
+## **Option 2: "Signal Graveyard" (More Memorable)**
+
+**Title:** "The Signal Graveyard: Promising Ideas That Didn't Pan Out"
+
+**Visual:** Tombstone graphics or a graveyard theme (can be tasteful/professional)
+
+**Structure:** Brief obituaries for each failed signal
+
+**Example Entry:**
+
+```
+⚰️ SENTIMENT ANALYSIS
+   "Negative tone predicts negative returns"
+   
+   Tested: 2023-2024
+   Result: IC = 0.01, Sharpe = 0.2
+   
+   Cause of Death: 8-K language is too formulaic and 
+   legally vetted. Little variation in tone within the 
+   event-driven context. Management saves sentiment 
+   expression for earnings calls, not SEC filings.
+   
+   R.I.P.
+```
+
+**Other Tombstones:**
+- Readability Scores
+- File Size Metrics  
+- Vocabulary Diversity
+- Average Sentence Length
+- Table/Exhibit Count (unless this worked?)
+
+**The Message:**
+> "Good research requires testing what **doesn't** work. These failures guided us toward signals with clearer behavioral interpretation and stronger theoretical foundations."
+
+---
+
+## **Option 3: "Negative Results" (Academic Tone)**
+
+**Title:** "Negative Results: Signals That Showed No Predictive Power"
+
+**Subtitle:** "Transparency in what we tested and why some signals failed"
+
+**Table Format:**
+
+| Category | Signal | IC | Sharpe | Why It Failed |
+|----------|--------|-----|--------|---------------|
+| **Text Complexity** | Flesch Reading Ease | 0.00 | 0.1 | Insufficient variation in 8-Ks |
+| | Fog Index | 0.00 | 0.1 | Same issue; 8-Ks already simple |
+| | Average Sentence Length | 0.01 | 0.2 | Too granular; no clear pattern |
+| **Sentiment** | Loughran-McDonald Negative | 0.01 | 0.2 | 8-Ks lack emotional language |
+| | Net Sentiment Score | 0.00 | 0.1 | Management tone too neutral |
+| **Structural** | File Size (KB) | 0.00 | 0.0 | PDF formatting noise |
+| | Exhibit Count | 0.01 | 0.2 | Weakly predictive, redundant with sections |
+| **Lexical** | Vocabulary Diversity (TTR) | -0.01 | -0.1 | Counterintuitive; boilerplate has high diversity |
+| | Unique Word Count | 0.00 | 0.1 | Correlated with length but no marginal value |
+
+**Discussion Points:**
+
+**Why Text Complexity Failed:**
+- 8-Ks have narrow readability range (grade 12-14)
+- Unlike 10-Ks which vary from grade 10-18
+- Insufficient cross-sectional variation to extract signal
+
+**Why Sentiment Failed:**
+- Regulatory language is deliberately neutral
+- Management avoids charged language in 8-Ks
+- Sentiment better suited for MD&A sections in 10-K/Q
+
+**Why File Metadata Failed:**
+- Technical artifacts (PDF version, compression) add noise
+- Text-based features more robust
+
+**The Learning:**
+> "These negative results reinforced our focus on **behavioral** rather than **linguistic** signals. Management can control word choice; they reveal more through structure, timing, and disclosure patterns."
+
+---
+
+## **Option 4: "Lessons from the Cutting Room Floor" (Narrative)**
+
+**Title:** "Lessons from the Cutting Room Floor"
+
+**Subtitle:** "Features we tested but ultimately excluded—and why"
+
+**Story Format:**
+
+**"The Sophistication Trap"**
+
+"Early in our research, we pursued sophisticated NLP features:
+- Sentiment scores using Loughran-McDonald dictionary
+- Readability metrics (Flesch-Kincaid, Gunning Fog)
+- Lexical diversity measures
+
+**The Problem:** These metrics work well for longer, narrative documents (analyst reports, 10-Ks). For short, event-driven 8-Ks with legal review, they showed minimal variation and no predictive power.
+
+**IC Range:** -0.01 to +0.01 (statistically zero)
+
+**The Lesson:** Domain matters. Tools that work for earnings calls don't necessarily work for regulatory filings."
+
+**"The Metadata Mirage"**
+
+"We hypothesized that file-level characteristics might signal something:
+- File size in KB (larger = more complex)
+- Number of exhibits attached
+- Presence of XBRL tags
+
+**The Problem:** File size is dominated by PDF formatting choices, not content. Exhibit counts weakly correlated with section counts but added no marginal information.
+
+**The Lesson:** Go straight to content. Metadata proxies introduce noise without adding signal."
+
+**"The Vocabulary Puzzle"**
+
+"We tested whether lexical diversity (unique words / total words) indicated disclosure quality.
+
+**The Irony:** Boilerplate legal language has *high* vocabulary diversity. Simple, direct disclosures actually have *lower* diversity.
+
+**Result:** Signal had *negative* correlation with returns (opposite of hypothesis)
+
+**The Lesson:** Linguistic features need strong economic intuition. Complexity metrics can be counterintuitive."
+
+---
+
+## **Option 5: "The Feature Selection Journey" (Methodological)**
+
+**Title:** "Feature Selection: From 20+ Candidates to 6 Core Signals"
+
+**Visual:** Funnel diagram showing the filtering process
+
+**Stage 1: Initial Brainstorm (20+ features)**
+```
+Text Features: Length, readability, sentiment, diversity, sentence metrics
+Structural: Sections, exhibits, tables, item types
+Metadata: File size, submission time, amendments
+Numerical: Number density, precision, percentage counts
+Behavioral: Filing delay, frequency, clustering
+```
+
+**Stage 2: Univariate Screening (Filter: |IC| > 0.02)**
+```
+Passed (10 features):
+✓ Length, Filtered Length, Number Density
+✓ Section Count, Material Length
+✓ Filing Delay, Filing Frequency
+✓ Item Diversity
+✗ Failed: Readability, Sentiment, File Size, etc.
+```
+
+**Stage 3: Rolling Transformation (Filter: IC improvement > 50%)**
+```
+Strong Improvement (6 features):
+✓ All length-based metrics
+✓ All structural metrics  
+✓ Filing delay
+
+Minimal Improvement (4 features):
+~ Item diversity (marginal)
+~ Filing frequency (redundant with count metrics)
+```
+
+**Stage 4: Correlation Analysis (Filter: ρ < 0.80)**
+```
+Final Selection (6 features):
+✓ Relatively orthogonal (ρ = 0.10-0.35)
+✓ Diverse dimensions (content, structure, behavior)
+✓ Strong individual performance
+✓ Complementary information
+```
+
+**The Takeaway:**
+> "Rigorous feature selection matters. We tested 3x more signals than we kept. The final six survived because they're interpretable, orthogonal, and consistently predictive."
+
+---
+
+## **My Recommendation: Option 3 + Elements of Option 1**
+
+**Title:** "What Didn't Work: Negative Results and Lessons Learned"
+
+**Layout:**
+
+**Top Section (30%):** Brief table showing failed signals with ICs
+
+**Middle Section (40%):** Three key lessons in boxes:
+
+```
+┌─────────────────────────────────────────────────┐
+│ LESSON 1: Linguistic Complexity ≠ Alpha         │
+│                                                  │
+│ Readability and sentiment metrics work for      │
+│ narrative documents (10-Ks, earnings calls)     │
+│ but not for short, legally-reviewed 8-Ks.       │
+│                                                  │
+│ Why: Insufficient cross-sectional variation     │
+└─────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────┐
+│ LESSON 2: Behavioral > Linguistic               │
+│                                                  │
+│ Management can carefully craft word choice.     │
+│ But behavioral signals (timing, patterns)       │
+│ are harder to manipulate.                       │
+│                                                  │
+│ Result: Delay (IC=0.08) >> Sentiment (IC=0.01) │
+└─────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────┐
+│ LESSON 3: Methodology > Feature Sophistication  │
+│                                                  │
+│ Simple features (length) with rolling           │
+│ aggregation outperformed sophisticated          │
+│ features (vocabulary diversity) with            │
+│ point-based measurement.                        │
+│                                                  │
+│ Takeaway: How you measure matters more than     │
+│ what you measure                                │
+└─────────────────────────────────────────────────┘
+```
+
+**Bottom Section (30%):** Brief commentary
+
+**The Message:**
+> "Strong research requires testing what **doesn't** work. These negative results guided our final framework toward behaviorally-grounded, interpretable signals with clear economic intuition. Publication bias favors only showing winners—we believe transparency about failures strengthens our conclusions."
+
+---
+
+## **Additional Suggestions**
+
+**Consider Adding:**
+
+1. **One Surprising Anti-Signal**
+   - Something that worked in the *opposite* direction of hypothesis
+   - Example: "High vocabulary diversity *negatively* predicted returns (IC = -0.01)"
+   - Shows you're not p-hacking; you found counterintuitive results
+
+2. **Resource Allocation Note**
+   - "We spent 30% of research time on signals that ultimately failed"
+   - Shows thoroughness and scientific rigor
+
+3. **Forward-Looking Teaser**
+   - "Some signals (like sentiment) might work better in different contexts"
+   - "Future work: Test these features on 10-K MD&A sections"
+
+---
+
+## **Presentation Tips for This Slide**
+
+**Timing:** 60-90 seconds max
+- Don't dwell, but don't rush
+- Confidence is key: "We tested this rigorously; here's what didn't work"
+
+**Tone:** 
+- Matter-of-fact, not defensive
+- "This is science; negative results are part of the process"
+- Slightly lighter than other slides (can use gentle humor: "RIP sentiment analysis")
+
+**Transitions:**
+- **Into:** "Before we wrap up, let's be transparent about what we tested but ultimately rejected..."
+- **Out of:** "These negative results clarified our thinking and led us to the six robust signals you've seen today. Now, let's discuss next steps..."
+
+**Why This Works for Senior Audience:**
+- Shows intellectual honesty (not cherry-picking)
+- Demonstrates thorough research process
+- Preempts "did you try X?" questions
+- Builds trust in your conclusions
+
+---
+
+Would you like me to create a specific layout for one of these options, or combine elements from multiple approaches?
