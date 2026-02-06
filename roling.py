@@ -1,142 +1,78 @@
 import polars as pl
-from datetime import timedelta
+import numpy as np
 
-# Assuming your dataframe is called 'df'
-result = (
-    df
-    .sort(['id', 'date'])
-    .group_by('id')
-    .map_groups(
-        lambda group: group.with_columns([
-            pl.col('section')
-            .rolling_map(
-                function=lambda s: [x for x in s if x is not None],
-                window_size=timedelta(days=181),  # 181 to include current day
-                min_periods=1
-            )
-            .alias('sections_180d')
-        ])
-    )
+# 假设你的df格式如下
+# df: columns = [ID, date, value]
+
+# 1. 计算1年移动平均
+df_with_ma = df.sort(['ID', 'date']).with_columns([
+    pl.col('value')
+      .rolling_mean(
+          window_size='365d',
+          by='date',
+          closed='left'  # 避免look-ahead bias
+      )
+      .over('ID')
+      .alias('value_ma_1y')
+])
+
+# 2. 计算长期分位数（基于移动平均）
+# 方法A: 全样本分位数
+df_with_tiles = df_with_ma.with_columns([
+    pl.col('value_ma_1y')
+      .rank(method='average')
+      .over('date')  # 每个日期横截面排序
+      .alias('rank')
+]).with_columns([
+    (pl.col('rank') / pl.col('rank').max().over('date'))
+      .alias('percentile')
+])
+
+# 方法B: 滚动历史分位数（更稳健）
+df_with_tiles = df_with_ma.sort(['ID', 'date']).with_columns([
+    pl.col('value_ma_1y')
+      .rolling_quantile(
+          quantile=0.5,  # 可以计算多个分位点
+          window_size='730d',  # 2年历史窗口
+          by='date'
+      )
+      .over('ID')
+      .alias('median_2y')
+])
+
+# 3. 创建分位数信号（例如五分位）
+df_final = df_with_tiles.with_columns([
+    pl.when(pl.col('percentile') <= 0.2).then(1)
+      .when(pl.col('percentile') <= 0.4).then(2)
+      .when(pl.col('percentile') <= 0.6).then(3)
+      .when(pl.col('percentile') <= 0.8).then(4)
+      .otherwise(5)
+      .alias('quintile')
+])
+
+# 4. 标准化为z-score形式（如果需要）
+df_final = df_final.with_columns([
+    ((pl.col('value_ma_1y') - pl.col('value_ma_1y').mean().over('date')) 
+     / pl.col('value_ma_1y').std().over('date'))
+     .alias('value_ma_zscore')
+])
+----
+几点建议基于你的filing signal经验：
+
+窗口选择: 你在8-K项目中发现90天窗口效果好，1年MA可能需要测试不同窗口（180d, 252d, 365d）
+避免前视偏差: 使用closed='left'确保只用历史数据
+处理缺失值:
+
+# 确保足够的历史数据
+df_filtered = df_with_ma.filter(
+    pl.col('value_ma_1y').is_not_null()
 )
-#--------------
-# Create a helper function to get date ranges
-def get_rolling_sections(df):
-    return (
-        df
-        .sort(['id', 'date'])
-        .with_columns([
-            (pl.col('date') - pl.duration(days=180)).alias('start_date')
-        ])
-        .join_asof(
-            df.filter(pl.col('section').is_not_null())
-              .sort(['id', 'date']),
-            left_on=['id', 'date'],
-            right_on=['id', 'date'],
-            strategy='backward'
-        )
-        .group_by(['id', 'date', 'start_date'])
-        .agg([
-            pl.col('section').filter(
-                pl.col('date').is_between(pl.col('start_date'), pl.col('date'))
-            ).drop_nulls().alias('sections_180d')
-        ])
-    )
-#---------------
-import polars as pl
-from datetime import timedelta
 
-def efficient_rolling_sections(df):
-    return (
-        df.lazy()  # Use lazy evaluation
-        .filter(pl.col('section').is_not_null())  # Filter nulls early
-        .sort(['id', 'date'])  # Sort once
-        .group_by('id', maintain_order=True)  # Maintain order for efficiency
-        .map_groups(
-            lambda group: group.with_columns([
-                pl.col('section')
-                .rolling_map(
-                    function=lambda s: s.to_list(),  # More efficient than list comprehension
-                    window_size=timedelta(days=181),
-                    min_periods=1,
-                    closed='both'
-                )
-                .alias('sections_180d')
-            ])
-        )
-        .collect(streaming=True)  # Use streaming for memory efficiency
-    )
+=========
 
+信号正交化: 如果你想将这个长期信号与短期信号组合：
+# 计算residual signal
+df_orthog = df_final.with_columns([
+    (pl.col('value') - pl.col('value_ma_1y')).alias('short_term_residual')
+])
 
-def highly_optimized_rolling_sections(df):
-    """
-    Most efficient approach for large datasets
-    """
-    return (
-        df.lazy()
-        .with_columns([
-            pl.col('date').cast(pl.Date),  # Ensure proper date type
-        ])
-        .filter(pl.col('section').is_not_null())  # Remove nulls early
-        .sort(['id', 'date'])
-        .with_columns([
-            # Create a more efficient rolling aggregation
-            pl.col('section')
-            .rolling_list(
-                window_size=timedelta(days=181),
-                min_periods=1,
-                closed='both'
-            )
-            .over('id', order_by='date')  # Use over instead of group_by when possible
-            .alias('sections_180d')
-        ])
-        .collect(streaming=True, slice_pushdown=True)
-    )
-
-def chunked_rolling_sections(df, chunk_size=1_000_000):
-    """
-    Process in chunks for datasets that don't fit in memory
-    """
-    # Get unique qids to avoid splitting groups
-    unique_qids = df.select('id').unique().sort('id')
-    
-    results = []
-    
-    for i in range(0, len(unique_qids), chunk_size):
-        chunk_qids = unique_qids.slice(i, chunk_size)
-        
-        chunk_result = (
-            df.lazy()
-            .filter(pl.col('id').is_in(chunk_qids.get_column('id')))
-            .pipe(highly_optimized_rolling_sections)  # Apply your function
-        )
-        
-        results.append(chunk_result)
-    
-    return pl.concat(results)
-
-# For datasets > 10GB, consider this approach
-def memory_efficient_approach(df):
-    return (
-        df.lazy()
-        .with_columns([
-            pl.col('date').cast(pl.Date)
-        ])
-        # Only select necessary columns early
-        .select(['qid', 'date', 'section'])
-        .filter(pl.col('section').is_not_null())
-        .sort(['qid', 'date'])
-        .group_by('qid', maintain_order=True)
-        .map_groups(
-            lambda group: group.with_columns([
-                pl.col('section')
-                .rolling_list(window_size='180d', min_periods=1)
-                .alias('sections_180d')
-            ])
-        )
-        .collect(
-            streaming=True,
-            slice_pushdown=True,
-            predicate_pushdown=True,
-            projection_pushdown=True
-        )
-    )
