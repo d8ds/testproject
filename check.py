@@ -13,3 +13,11 @@ print(f"factset_entity_id nunique after left join: {merged_check['factset_entity
 sample_qid = list(overlap_qids)[0]
 print(sentiment_with_eff.filter(pl.col("qid") == sample_qid).select(["qid", "date", "effective_report_date"]).head())
 print(etf_df.filter(pl.col("qid") == sample_qid).select(["qid", "report_date"]))
+
+
+# 最关键的：effective_report_date 的值是否出现在 report_date 里
+eff_dates = set(result1["effective_report_date"].to_list())
+rep_dates = set(result2["report_date"].to_list())
+print(f"effective_report_dates: {eff_dates}")
+print(f"report_dates in etf: {rep_dates}")
+print(f"overlap: {eff_dates & rep_dates}")
