@@ -21,3 +21,32 @@ rep_dates = set(result2["report_date"].to_list())
 print(f"effective_report_dates: {eff_dates}")
 print(f"report_dates in etf: {rep_dates}")
 print(f"overlap: {eff_dates & rep_dates}")
+
+
+# backward：找最近的历史快照（2017年后的数据）
+date_mapping_backward = unique_doc_dates.join_asof(
+    unique_report_dates.rename({"report_date": "effective_report_date"}),
+    left_on="date",
+    right_on="effective_report_date",
+    strategy="backward",
+)
+
+# forward：对 backward 结果为 null 的，找最近的未来快照
+date_mapping_forward = unique_doc_dates.join_asof(
+    unique_report_dates.rename({"report_date": "effective_report_date"}),
+    left_on="date",
+    right_on="effective_report_date",
+    strategy="forward",
+)
+
+# 合并：backward 有结果就用 backward，否则用 forward
+date_mapping = date_mapping_backward.with_columns(
+    pl.when(pl.col("effective_report_date").is_null())
+    .then(date_mapping_forward["effective_report_date"])
+    .otherwise(pl.col("effective_report_date"))
+    .alias("effective_report_date")
+)
+
+# 验证：不应该再有 null 了
+print(date_mapping["effective_report_date"].null_count())
+print(date_mapping["effective_report_date"].value_counts().sort("count", descending=True).head(10))
