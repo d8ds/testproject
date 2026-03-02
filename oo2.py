@@ -40,6 +40,16 @@ df = df.with_columns(
     (pl.col("weight") * pl.col("fwd_return")).alias("pnl")
 )
 
+cost = 0.001
+
+df = df.with_columns(
+    ((pl.col("weight") - pl.col("prev_weight")).abs() * cost).alias("cost")
+)
+
+df = df.with_columns(
+    (pl.col("pnl") - pl.col("cost")).alias("pnl_after_cost")
+)
+
 daily_pnl = df.group_by("date").agg(
     pl.col("pnl").sum().alias("daily_pnl")
 ).sort("date")
