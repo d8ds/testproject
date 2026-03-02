@@ -1,23 +1,22 @@
 import pandas as pd
 import numpy as np
+from tqdm import tqdm
 
-def aggregate_with_asof_merge(broker_df, sector_df, max_lag_days=90):
+def aggregate_with_manual_lookup(broker_df, sector_df, max_lag_days=90):
     """
-    使用as-of merge策略：为每个broker report找到最近的sector权重
+    手动实现向后查找逻辑，避免merge_asof的排序问题
     """
     
-    # Step 1: 深度复制并清理
+    # Step 1: 预处理
     broker_df = broker_df.copy()
     sector_df = sector_df.copy()
     
-    # 统一datetime格式
-    broker_df['date'] = pd.to_datetime(broker_df['date']).astype('datetime64[ns]')
-    sector_df['date'] = pd.to_datetime(sector_df['date']).astype('datetime64[ns]')
+    broker_df['date'] = pd.to_datetime(broker_df['date'])
+    sector_df['date'] = pd.to_datetime(sector_df['date'])
     
-    # 🔧 关键：移除任何NaN日期或qid
-    print("清理数据...")
-    broker_df = broker_df.dropna(subset=['date', 'qid'])
-    sector_df = sector_df.dropna(subset=['date', 'qid'])
+    # 清理
+    broker_df = broker_df.dropna(subset=['date', 'qid', 'sentiment'])
+    sector_df = sector_df.dropna(subset=['date', 'qid', 'weight', 'sector'])
     
     print(f"Broker记录: {len(broker_df):,}")
     print(f"Sector记录: {len(sector_df):,}")
@@ -27,128 +26,72 @@ def aggregate_with_asof_merge(broker_df, sector_df, max_lag_days=90):
         ['qid', 'date', 'document_id']
     )['sentiment'].mean().reset_index()
     
-    print(f"\n聚合后的Broker记录: {len(doc_sentiment):,}")
+    print(f"聚合后记录: {len(doc_sentiment):,}\n")
     
-    # 🔧 关键修复：确保qid是字符串类型（避免类型不匹配）
-    doc_sentiment['qid'] = doc_sentiment['qid'].astype(str)
-    sector_df['qid'] = sector_df['qid'].astype(str)
+    # Step 2: 为每个qid创建权重查找字典
+    print("构建权重查找索引...")
     
-    # 🔧 严格排序：先按qid，再按date
-    print("\n严格排序数据...")
-    doc_sentiment = doc_sentiment.sort_values(
-        ['qid', 'date'], 
-        ascending=[True, True]
-    ).reset_index(drop=True)
+    # 按qid分组，为每个qid创建日期->权重的映射
+    sector_by_qid = {}
+    for qid in tqdm(sector_df['qid'].unique(), desc="构建索引"):
+        qid_data = sector_df[sector_df['qid'] == qid].sort_values('date')
+        sector_by_qid[qid] = qid_data[['date', 'weight', 'sector']].values  # numpy array更快
     
-    sector_df = sector_df.sort_values(
-        ['qid', 'date'], 
-        ascending=[True, True]
-    ).reset_index(drop=True)
+    print(f"✓ 索引构建完成，覆盖{len(sector_by_qid):,}个qid\n")
     
-    # 🔧 验证排序（更严格）
-    print("验证排序...")
+    # Step 3: 手动查找每条记录的权重
+    print("查找最近权重...")
     
-    # 检查是否有重复的qid导致排序问题
-    doc_qid_check = doc_sentiment.groupby('qid')['date'].apply(
-        lambda x: x.is_monotonic_increasing
-    )
-    sector_qid_check = sector_df.groupby('qid')['date'].apply(
-        lambda x: x.is_monotonic_increasing
-    )
+    results = []
+    max_lag_timedelta = pd.Timedelta(days=max_lag_days)
     
-    if not doc_qid_check.all():
-        bad_qids = doc_qid_check[~doc_qid_check].index.tolist()
-        print(f"⚠️  警告：doc_sentiment中有{len(bad_qids)}个qid的日期未正确排序")
-        print(f"示例qid: {bad_qids[:5]}")
-        # 强制重排
-        doc_sentiment = doc_sentiment.sort_values(['qid', 'date']).reset_index(drop=True)
-    
-    if not sector_qid_check.all():
-        bad_qids = sector_qid_check[~sector_qid_check].index.tolist()
-        print(f"⚠️  警告：sector_df中有{len(bad_qids)}个qid的日期未正确排序")
-        print(f"示例qid: {bad_qids[:5]}")
-        # 强制重排
-        sector_df = sector_df.sort_values(['qid', 'date']).reset_index(drop=True)
-    
-    print("✓ 排序验证通过\n")
-    
-    # 🔧 再次确认排序（pandas有时会有bug）
-    # 使用sort_index确保完全排序
-    doc_sentiment = doc_sentiment.sort_values(['qid', 'date']).reset_index(drop=True)
-    sector_df_merge = sector_df[['qid', 'date', 'weight', 'sector']].sort_values(
-        ['qid', 'date']
-    ).reset_index(drop=True)
-    
-    # Step 2: 执行merge_asof
-    print("执行merge_asof...")
-    try:
-        merged = pd.merge_asof(
-            doc_sentiment,
-            sector_df_merge,
-            on='date',
-            by='qid',
-            direction='backward',
-            tolerance=pd.Timedelta(days=max_lag_days)
-        )
-        print("✓ Merge成功")
-    except ValueError as e:
-        print(f"❌ Merge失败: {e}")
-        print("\n调试信息:")
-        print(f"doc_sentiment shape: {doc_sentiment.shape}")
-        print(f"sector_df_merge shape: {sector_df_merge.shape}")
-        print(f"\ndoc_sentiment前5行:")
-        print(doc_sentiment.head())
-        print(f"\nsector_df_merge前5行:")
-        print(sector_df_merge.head())
+    for idx, row in tqdm(doc_sentiment.iterrows(), total=len(doc_sentiment), desc="匹配权重"):
+        qid = row['qid']
+        date = row['date']
         
-        # 尝试找出问题qid
-        print("\n检查前10个qid的排序...")
-        for qid in doc_sentiment['qid'].unique()[:10]:
-            doc_dates = doc_sentiment[doc_sentiment['qid'] == qid]['date']
-            sector_dates = sector_df_merge[sector_df_merge['qid'] == qid]['date']
-            
-            if not doc_dates.is_monotonic_increasing:
-                print(f"  {qid}: doc dates NOT sorted")
-            if len(sector_dates) > 0 and not sector_dates.is_monotonic_increasing:
-                print(f"  {qid}: sector dates NOT sorted")
+        # 检查这个qid是否有权重信息
+        if qid not in sector_by_qid:
+            continue
         
-        return None, None, None
+        # 获取这个qid的所有权重记录
+        qid_weights = sector_by_qid[qid]
+        
+        # 找到最近的、不晚于当前日期的权重
+        # qid_weights: [date, weight, sector]
+        valid_weights = qid_weights[qid_weights[:, 0] <= date]
+        
+        if len(valid_weights) == 0:
+            continue
+        
+        # 取最近的一条
+        latest_idx = -1  # 已经排序，最后一条就是最近的
+        weight_date, weight, sector = valid_weights[latest_idx]
+        
+        # 检查时间差
+        lag = date - weight_date
+        if lag > max_lag_timedelta:
+            continue
+        
+        results.append({
+            'qid': qid,
+            'date': date,
+            'document_id': row['document_id'],
+            'sentiment': row['sentiment'],
+            'weight': weight,
+            'sector': sector,
+            'weight_date': weight_date,
+            'weight_lag_days': lag.days
+        })
     
-    print(f"匹配到权重的记录数: {merged['weight'].notna().sum():,} / {len(merged):,}")
+    print(f"\n✓ 匹配完成：{len(results):,} / {len(doc_sentiment):,} ({len(results)/len(doc_sentiment):.1%})\n")
     
-    # Step 3: 简化的权重日期计算
-    print("计算权重滞后天数...")
-    
-    # 为每个匹配的记录找到对应的权重日期
-    # 方法：按qid-weight-sector组合合并
-    sector_dates = sector_df[['qid', 'weight', 'sector', 'date']].drop_duplicates()
-    sector_dates = sector_dates.rename(columns={'date': 'weight_date'})
-    
-    merged = merged.merge(
-        sector_dates,
-        on=['qid', 'weight', 'sector'],
-        how='left'
-    )
-    
-    # 处理可能的多个匹配（取最接近的日期）
-    merged['date_diff'] = (merged['date'] - merged['weight_date']).abs()
-    merged = merged.sort_values('date_diff').groupby(
-        ['qid', 'date', 'document_id'], as_index=False
-    ).first()
-    
-    merged['weight_lag_days'] = (merged['date'] - merged['weight_date']).dt.days
-    merged = merged.drop(['date_diff'], axis=1, errors='ignore')
-    
-    # Step 4: 过滤有效记录
-    merged_valid = merged[merged['weight'].notna()].copy()
-    
-    if len(merged_valid) == 0:
+    if len(results) == 0:
         print("❌ 没有任何记录匹配到权重！")
         return None, None, None
     
-    print(f"✓ 有效记录数: {len(merged_valid):,}\n")
+    merged_valid = pd.DataFrame(results)
     
-    # Step 5: 重新标准化权重
+    # Step 4: 重新标准化权重
     print("重新标准化权重...")
     daily_sector_weight = merged_valid.groupby(['date', 'sector'])['weight'].sum().reset_index()
     daily_sector_weight.columns = ['date', 'sector', 'total_weight']
@@ -156,27 +99,30 @@ def aggregate_with_asof_merge(broker_df, sector_df, max_lag_days=90):
     merged_valid = merged_valid.merge(daily_sector_weight, on=['date', 'sector'])
     merged_valid['normalized_weight'] = merged_valid['weight'] / merged_valid['total_weight']
     
-    # Step 6: 计算加权sentiment
-    print("计算sector级别加权sentiment...\n")
+    # Step 5: 计算加权sentiment
+    print("计算sector级别信号...\n")
     
-    sector_signals = merged_valid.groupby(['date', 'sector']).apply(
-        lambda x: pd.Series({
-            'weighted_sentiment': (x['sentiment'] * x['normalized_weight']).sum(),
-            'raw_weight_sum': x['weight'].sum(),
-            'n_stocks': x['qid'].nunique(),
-            'n_documents': x['document_id'].nunique(),
-            'avg_weight_lag': x['weight_lag_days'].mean()
-        })
-    ).reset_index()
+    sector_signals = merged_valid.groupby(['date', 'sector']).agg({
+        'sentiment': lambda x: (x * merged_valid.loc[x.index, 'normalized_weight']).sum(),
+        'weight': 'sum',
+        'qid': 'nunique',
+        'document_id': 'nunique',
+        'weight_lag_days': 'mean'
+    }).reset_index()
     
-    # Step 7: 计算覆盖率
+    sector_signals.columns = [
+        'date', 'sector', 'weighted_sentiment', 
+        'raw_weight_sum', 'n_stocks', 'n_documents', 'avg_weight_lag'
+    ]
+    
+    # Step 6: 计算覆盖率
     latest_sector_weights = sector_df.groupby('sector')['weight'].sum().reset_index()
     latest_sector_weights.columns = ['sector', 'theoretical_weight']
     
     sector_signals = sector_signals.merge(latest_sector_weights, on='sector', how='left')
     sector_signals['coverage_ratio'] = sector_signals['raw_weight_sum'] / sector_signals['theoretical_weight']
     
-    # Step 8: 诊断
+    # Step 7: 诊断
     diagnostics = {
         'total_broker_records': len(doc_sentiment),
         'matched_records': len(merged_valid),
@@ -201,27 +147,46 @@ def aggregate_with_asof_merge(broker_df, sector_df, max_lag_days=90):
 
 # 执行
 print("="*60)
-print("Sector信号聚合")
-print("="*60)
+print("Sector信号聚合 (手动查找版本)")
+print("="*60 + "\n")
 
-sector_signals, merged_valid, diagnostics = aggregate_with_asof_merge(
+sector_signals, merged_valid, diagnostics = aggregate_with_manual_lookup(
     broker_df, 
     sector_df,
     max_lag_days=90
 )
 
 if sector_signals is not None:
-    print("\n" + "="*60)
+    print("="*60)
     print("诊断结果")
     print("="*60)
     print(f"总Broker记录: {diagnostics['total_broker_records']:,}")
     print(f"成功匹配: {diagnostics['matched_records']:,} ({diagnostics['match_rate']:.1%})")
     print(f"\n生成信号日期数: {diagnostics['unique_dates']:,}")
     print(f"日期范围: {diagnostics['date_range'][0].date()} 到 {diagnostics['date_range'][1].date()}")
-    print(f"\n权重滞后: 中位数={diagnostics['median_weight_lag_days']:.0f}天, "
-          f"平均={diagnostics['avg_weight_lag_days']:.1f}天")
-    print(f"\nSector数: {diagnostics['n_sectors']}")
-    print(f"平均覆盖率: {diagnostics['avg_coverage']:.1%}")
+    print(f"\n权重滞后统计:")
+    print(f"  中位数: {diagnostics['median_weight_lag_days']:.0f} 天")
+    print(f"  平均值: {diagnostics['avg_weight_lag_days']:.1f} 天")
+    print(f"  最大值: {diagnostics['max_weight_lag_days']:.0f} 天")
+    print(f"\nSector覆盖:")
+    print(f"  总数: {diagnostics['n_sectors']}")
+    print(f"  平均覆盖率: {diagnostics['avg_coverage']:.1%}")
+    print(f"  平均每信号股票数: {diagnostics['avg_stocks_per_signal']:.1f}")
     
-    print("\n示例:")
-    print(sector_signals.head(10).to_string(index=False))
+    print("\n" + "="*60)
+    print("信号示例 (前10条)")
+    print("="*60)
+    display_cols = ['date', 'sector', 'weighted_sentiment', 'n_stocks', 
+                    'coverage_ratio', 'avg_weight_lag']
+    print(sector_signals[display_cols].head(10).to_string(index=False))
+    
+    print("\n" + "="*60)
+    print("按Sector统计")
+    print("="*60)
+    sector_stats = sector_signals.groupby('sector').agg({
+        'weighted_sentiment': 'count',
+        'coverage_ratio': 'mean',
+        'n_stocks': 'mean'
+    }).round(3)
+    sector_stats.columns = ['n_signals', 'avg_coverage', 'avg_stocks']
+    print(sector_stats.sort_values('n_signals', ascending=False))
