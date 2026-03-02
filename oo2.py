@@ -1,92 +1,64 @@
-import polars as pl
+import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
 
-# Ensure sorted
-signal_df = signal_df.sort(["sector", "date"])
-df_returns = df_returns.sort(["sector", "date"])
+# 1. Regenerate Dummy Data (Pandas)
+num_days = 500
+sectors = ["Tech", "Finance", "Energy", "Health", "Retail"]
+dates = [datetime(2022, 1, 1) + timedelta(days=i) for i in range(num_days)]
 
-# Shift returns backward (so signal_t uses return_t+1)
-df_returns = df_returns.with_columns(
-    pl.col("total_return")
-      .shift(-1)
-      .over("sector")
-      .alias("fwd_return")
-)
+data_signals = []
+for d in dates:
+    for s in sectors:
+        data_signals.append({"sector": s, "date": d, "value": np.random.uniform(-1, 1)})
+df_signals = pd.DataFrame(data_signals)
 
-# Join
-df = signal_df.join(
-    df_returns.select(["date", "sector", "fwd_return"]),
-    on=["date", "sector"],
-    how="inner"
-).drop_nulls()
+data_returns = []
+for d in dates:
+    for s in sectors:
+        data_returns.append({"date": d, "sector": s, "total_return": np.random.normal(0.0002, 0.01)})
+df_returns = pd.DataFrame(data_returns)
 
-df = df.with_columns(
-    (
-        pl.col("value") -
-        pl.col("value").mean().over("date")
-    ).alias("signal_demeaned")
-)
+# 2. Join and Strategy Calculation
+df_combined = pd.merge(df_signals, df_returns, on=["date", "sector"])
+df_combined["weighted_return"] = df_combined["value"] * df_combined["total_return"]
 
-# scale to 1 gross leverage
-df = df.with_columns(
-    (
-        pl.col("signal_demeaned") /
-        pl.col("signal_demeaned").abs().sum().over("date")
-    ).alias("weight")
-)
+# Daily strategy return
+df_daily_pnl = df_combined.groupby("date")["weighted_return"].sum().reset_index()
+df_daily_pnl = df_daily_pnl.sort_values("date")
 
-df = df.with_columns(
-    (pl.col("weight") * pl.col("fwd_return")).alias("pnl")
-)
+# 3. Rolling Sharpe Ratio Calculation (e.g., 60-day window)
+window = 60
+rolling_mean = df_daily_pnl["weighted_return"].rolling(window=window).mean()
+rolling_std = df_daily_pnl["weighted_return"].rolling(window=window).std()
+df_daily_pnl["rolling_sharpe"] = (rolling_mean / rolling_std) * np.sqrt(252)
 
-cost = 0.001
+# 4. Sector-wise Sharpe Ratio
+sector_returns = df_combined.groupby("sector")["weighted_return"].agg(["mean", "std"])
+sector_returns["sharpe"] = (sector_returns["mean"] / sector_returns["std"]) * np.sqrt(252)
+sector_returns = sector_returns.sort_values("sharpe", ascending=False)
 
-df = df.with_columns(
-    ((pl.col("weight") - pl.col("prev_weight")).abs() * cost).alias("cost")
-)
+# 5. Plotting
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
 
-df = df.with_columns(
-    (pl.col("pnl") - pl.col("cost")).alias("pnl_after_cost")
-)
+# Rolling Sharpe Plot
+ax1.plot(df_daily_pnl["date"], df_daily_pnl["rolling_sharpe"], color='teal', label=f"{window}-Day Rolling Sharpe")
+ax1.axhline(0, color='black', linestyle='--', linewidth=0.8)
+ax1.set_title(f"Rolling Strategy Sharpe Ratio ({window}-Day Window)")
+ax1.set_ylabel("Annualized Sharpe Ratio")
+ax1.grid(True, alpha=0.3)
+ax1.legend()
 
-daily_pnl = df.group_by("date").agg(
-    pl.col("pnl").sum().alias("daily_pnl")
-).sort("date")
+# Sector-wise Sharpe Plot (Bar chart)
+sector_returns["sharpe"].plot(kind='bar', ax=ax2, color='skyblue', edgecolor='navy')
+ax2.set_title("Annualized Sharpe Ratio by Sector")
+ax2.set_ylabel("Sharpe Ratio")
+ax2.set_xlabel("Sector")
+ax2.grid(axis='y', linestyle='--', alpha=0.7)
 
-returns = daily_pnl["daily_pnl"].to_numpy()
+plt.tight_layout()
+plt.savefig("sharpe_ratio_plots.png")
 
-mean_ret = np.mean(returns)
-std_ret = np.std(returns)
-
-# Annualization (assume 252 trading days)
-sharpe = np.sqrt(252) * mean_ret / std_ret
-
-cumulative = np.cumprod(1 + returns)
-
-max_dd = np.max(np.maximum.accumulate(cumulative) - cumulative)
-max_dd_pct = max_dd / np.maximum.accumulate(cumulative).max()
-
-print("Sharpe:", sharpe)
-print("Mean daily return:", mean_ret)
-print("Vol:", std_ret)
-print("Max Drawdown:", max_dd_pct)
-
-plt.figure()
-plt.plot(daily_pnl["date"], cumulative)
-plt.title("Cumulative PnL")
-plt.xticks(rotation=45)
-plt.show()
-
-df = df.with_columns(
-    pl.col("weight").shift(1).over("sector").alias("prev_weight")
-)
-
-turnover = df.with_columns(
-    (pl.col("weight") - pl.col("prev_weight")).abs()
-).group_by("date").agg(
-    pl.col("weight").sum().alias("daily_turnover")
-)
-
-avg_turnover = turnover["daily_turnover"].mean()
-print("Average turnover:", avg_turnover)
+# Prepare summary for response
+print(sector_returns["sharpe"])
