@@ -1,3 +1,83 @@
+def convert_with_explicit_enddate(df_sector):
+    """
+    将endDate设为下一段的startDate - 1天
+    适用于rebalancing日期不连续的情况
+    """
+    
+    interval_df = (
+        df_sector
+        .sort(['sectorId', 'qid', 'date'])
+        .with_columns([
+            pl.col('weight')
+              .shift(1)
+              .over(['sectorId', 'qid'])
+              .alias('prev_weight')
+        ])
+        .with_columns([
+            (
+                (pl.col('weight') != pl.col('prev_weight')) |
+                pl.col('prev_weight').is_null()
+            ).alias('is_change')
+        ])
+        .with_columns([
+            pl.col('is_change')
+              .cum_sum()
+              .over(['sectorId', 'qid'])
+              .alias('change_group')
+        ])
+        .group_by(['sectorId', 'qid', 'change_group', 'weight'])
+        .agg([
+            pl.col('date').min().alias('startDate')
+        ])
+        .sort(['sectorId', 'qid', 'startDate'])
+        # 添加endDate：下一个startDate - 1天
+        .with_columns([
+            pl.col('startDate')
+              .shift(-1)
+              .over(['sectorId', 'qid'])
+              .alias('next_startDate')
+        ])
+        .with_columns([
+            pl.when(pl.col('next_startDate').is_not_null())
+              .then(pl.col('next_startDate') - pl.duration(days=1))
+              .otherwise(pl.date(2099, 12, 31))  # 最后一段，用一个很远的未来日期
+              .alias('endDate')
+        ])
+        .select(['sectorId', 'qid', 'startDate', 'endDate', 'weight'])
+    )
+    
+    return interval_df
+
+
+def create_signal_with_rebalancing(
+    df_company,
+    df_sector,  # 包含startDate和endDate列
+    lookback_days=30
+):
+    """
+    处理公司在sector中的进出
+    df_sector应该有：[sectorId, qid, startDate, endDate, weight]
+    """
+    
+    # Step 1: 为每个sentiment，检查公司是否在sector内
+    sentiment_valid = (
+        df_company
+        .join(
+            df_sector,
+            left_on='id',
+            right_on='qid',
+            how='left'
+        )
+        .filter(
+            (pl.col('date') >= pl.col('startDate')) &
+            (pl.col('date') <= pl.col('endDate'))
+        )
+    )
+    
+    # 后续同方法B
+    # ...
+
+
 def create_pit_sector_signal_explicit(
     df_company,
     df_sector,
