@@ -290,4 +290,163 @@ class SectorSignalBuilder:
             ])
             .with_columns([
                 # 如果当前没有新信号，forward fill上一个good signal
-                pl.col('smoothed_s
+                pl.col('smoothed_signal')
+                  .forward_fill()
+                  .over('sectorId')
+                  .alias('final_signal')
+            ])
+        )
+        
+        return filtered_signal
+    
+    def _calculate_signal_quality(self) -> pl.Expr:
+        """
+        计算信号质量分数 (0-1)
+        考虑: coverage, diversity, concentration
+        """
+        return (
+            # Coverage分数
+            pl.min_horizontal([
+                pl.col('n_companies') / (self.min_companies * 2),
+                pl.lit(1.0)
+            ]) * 0.4 +
+            
+            # Weight coverage分数
+            pl.min_horizontal([
+                pl.col('weight_coverage') / 0.5,
+                pl.lit(1.0)
+            ]) * 0.3 +
+            
+            # Diversity分数 (避免过度集中)
+            (1.0 - pl.col('max_single_weight')) * 0.3
+        )
+    
+    def generate_signal_statistics(
+        self,
+        final_signal: pl.DataFrame
+    ) -> pl.DataFrame:
+        """
+        生成信号质量统计报告
+        """
+        
+        stats = (
+            final_signal
+            .group_by('sectorId')
+            .agg([
+                # 基本统计
+                pl.count().alias('n_dates'),
+                pl.col('final_signal').is_not_null().sum().alias('n_valid_signals'),
+                
+                # 信号质量
+                pl.col('signal_quality').mean().alias('avg_quality'),
+                pl.col('n_companies').mean().alias('avg_coverage'),
+                pl.col('weight_coverage').mean().alias('avg_weight_cov'),
+                
+                # 信号特性
+                pl.col('final_signal').std().alias('signal_volatility'),
+                pl.col('final_signal').diff().abs().mean().alias('avg_turnover'),
+                
+                # 稀疏性
+                (pl.col('n_companies') < self.min_companies).sum().alias('n_low_coverage_days'),
+                pl.col('max_single_weight').mean().alias('avg_concentration')
+            ])
+            .with_columns([
+                (pl.col('n_valid_signals') / pl.col('n_dates')).alias('signal_coverage_pct')
+            ])
+            .sort('sectorId')
+        )
+        
+        return stats
+
+
+# ============== 辅助函数 ==============
+
+def create_sample_data():
+    """创建测试数据"""
+    
+    # Company level sentiment data
+    df_company = pl.DataFrame({
+        'id': ['A', 'A', 'A', 'B', 'B', 'C', 'C', 'D', 'D'],
+        'documentid': ['doc1', 'doc2', 'doc3', 'doc4', 'doc5', 'doc6', 'doc7', 'doc8', 'doc9'],
+        'date': [
+            '2024-01-05', '2024-01-15', '2024-02-10',
+            '2024-01-08', '2024-02-05',
+            '2024-01-20', '2024-02-15',
+            '2024-01-25', '2024-02-20'
+        ],
+        'sentiment': [0.5, 0.6, 0.4, 0.3, 0.7, 0.2, 0.8, 0.1, 0.9]
+    }).with_columns(pl.col('date').str.to_date())
+    
+    # Sector composition with rebalancing
+    # Sector 1在2024-02-01发生rebalancing，权重变化
+    df_sector = pl.DataFrame({
+        'sectorId': [1, 1, 1, 1, 1, 1, 1, 1, 2, 2],
+        'qid': ['A', 'A', 'B', 'B', 'C', 'C', 'D', 'D', 'C', 'D'],
+        'date': [
+            '2024-01-01', '2024-02-01',  # A的权重变化
+            '2024-01-01', '2024-02-01',  # B的权重变化
+            '2024-01-01', '2024-02-01',  # C的权重变化
+            '2024-01-01', '2024-02-01',  # D加入sector
+            '2024-01-01', '2024-01-01'   # Sector 2
+        ],
+        'weight': [0.4, 0.3, 0.4, 0.3, 0.2, 0.2, 0.0, 0.2, 0.6, 0.4]
+    }).with_columns(pl.col('date').str.to_date())
+    
+    return df_company, df_sector
+
+
+# ============== 主函数 ==============
+
+def main():
+    """完整示例"""
+    
+    print("=" * 60)
+    print("Sector Signal Builder - Complete Example")
+    print("=" * 60)
+    
+    # 1. 创建测试数据（或加载你的真实数据）
+    df_company, df_sector = create_sample_data()
+    
+    print("\nInput Data:")
+    print(f"  Company sentiment records: {len(df_company)}")
+    print(f"  Sector composition records: {len(df_sector)}")
+    
+    # 2. 初始化signal builder
+    builder = SectorSignalBuilder(
+        lookback_days=30,
+        min_companies=2,  # 测试数据较小，降低阈值
+        min_weight_coverage=0.15,
+        signal_decay_halflife=7,
+        gap_threshold_days=60
+    )
+    
+    # 3. 创建sector signal
+    print("\n" + "=" * 60)
+    final_signal = builder.create_sector_signal(df_company, df_sector)
+    
+    # 4. 查看结果
+    print("\n" + "=" * 60)
+    print("Final Signals (sample):")
+    print("=" * 60)
+    print(
+        final_signal
+        .filter(pl.col('final_signal').is_not_null())
+        .head(10)
+    )
+    
+    # 5. 生成统计报告
+    print("\n" + "=" * 60)
+    print("Signal Quality Statistics:")
+    print("=" * 60)
+    stats = builder.generate_signal_statistics(final_signal)
+    print(stats)
+    
+    # 6. 保存结果
+    # final_signal.write_parquet('sector_signals.parquet')
+    # stats.write_csv('signal_statistics.csv')
+    
+    return final_signal, stats
+
+
+if __name__ == '__main__':
+    final_signal, stats = main()
