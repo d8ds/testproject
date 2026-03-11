@@ -1,235 +1,163 @@
-class FilingSignalV2:
-    """
-    不依赖行业的增强signal系统
-    """
-    
-    def __init__(self, filing_df: pl.DataFrame):
-        self.df = filing_df.with_columns([
-            pl.col("date").cast(pl.Date),
-            (pl.col("filing_date") - pl.col("event_date")).dt.total_seconds().alias("delay_seconds"),
-            (pl.col("filing_date") - pl.col("event_date")).dt.total_days().alias("delay_days"),
-        ]).sort(["qid", "date"])
-    
-    def generate_base_signals(self) -> pl.DataFrame:
-        """
-        生成基础信号（不需要行业）
-        """
-        
-        df = self.df
-        
-        # ===== 1. 个股历史标准化 =====
-        df = df.with_columns([
-            # 历史均值和标准差（过去所有filing）
-            pl.col("delay_seconds").mean().over("qid").alias("qid_mean_delay"),
-            pl.col("delay_seconds").std().over("qid").alias("qid_std_delay"),
-            
-            # 滚动均值（最近4次filing）
-            pl.col("delay_seconds").rolling_mean(4).over("qid").alias("qid_ma4_delay"),
-            pl.col("delay_seconds").rolling_std(4).over("qid").alias("qid_std4_delay"),
-            
-            # 前一次delay
-            pl.col("delay_seconds").shift(1).over("qid").alias("prev_delay"),
-        ])
-        
-        # Z-scores
-        df = df.with_columns([
-            # 相对于全历史
-            ((pl.col("delay_seconds") - pl.col("qid_mean_delay")) / 
-             pl.col("qid_std_delay")).alias("delay_z_hist"),
-            
-            # 相对于近期（更敏感）
-            ((pl.col("delay_seconds") - pl.col("qid_ma4_delay")) / 
-             pl.col("qid_std4_delay")).alias("delay_z_recent"),
-            
-            # 变化率
-            ((pl.col("delay_seconds") - pl.col("prev_delay")) / 
-             pl.col("prev_delay")).alias("delay_pct_change"),
-        ])
-        
-        # ===== 2. 截面标准化（每个日期横截面） =====
-        df = df.with_columns([
-            # Rank标准化 (0-1)
-            pl.col("delay_seconds").rank().over("date").alias("delay_rank_raw"),
-            pl.col("qid").count().over("date").alias("n_stocks"),
-        ]).with_columns([
-            (pl.col("delay_rank_raw") / pl.col("n_stocks")).alias("delay_rank_pct"),
-            
-            # 截面Z-score
-            ((pl.col("delay_seconds") - pl.col("delay_seconds").mean().over("date")) /
-             pl.col("delay_seconds").std().over("date")).alias("delay_z_cross"),
-        ])
-        
-        # ===== 3. 趋势和加速度 =====
-        df = df.with_columns([
-            # 延迟趋势（是在恶化还是改善）
-            (pl.col("delay_seconds") - pl.col("delay_seconds").shift(1).over("qid")
-            ).alias("delay_delta1"),
-            
-            (pl.col("delay_seconds").shift(1).over("qid") - 
-             pl.col("delay_seconds").shift(2).over("qid")
-            ).alias("delay_delta2"),
-        ]).with_columns([
-            # 加速度：变化的变化
-            (pl.col("delay_delta1") - pl.col("delay_delta2")).alias("delay_acceleration"),
-        ])
-        
-        # ===== 4. Length相关特征 =====
-        df = df.with_columns([
-            pl.col("length").shift(1).over("qid").alias("prev_length"),
-            pl.col("length").rolling_mean(4).over("qid").alias("ma4_length"),
-        ]).with_columns([
-            (pl.col("length") - pl.col("prev_length")).alias("length_change"),
-            ((pl.col("length") - pl.col("ma4_length")) / pl.col("ma4_length")).alias("length_surprise"),
-        ])
-        
-        # ===== 5. 组合信号 =====
-        df = df.with_columns([
-            # Signal 1: 极端delay（个股视角）
-            pl.when(pl.col("delay_z_recent").abs() > 2)
-              .then(-pl.col("delay_z_recent"))  # 负号：delay大 = 负信号
-              .otherwise(0)
-              .alias("signal_extreme_delay"),
-            
-            # Signal 2: 加速恶化
-            pl.when(
-                (pl.col("delay_z_recent") > 1) &  # delay已经很大
-                (pl.col("delay_acceleration") > 0)  # 还在恶化
-            ).then(-2.0)  # 强负信号
-              .when(
-                (pl.col("delay_z_recent") < -1) &  # delay很小
-                (pl.col("delay_acceleration") < 0)  # 还在改善
-            ).then(2.0)  # 强正信号
-              .otherwise(0)
-              .alias("signal_accelerating"),
-            
-            # Signal 3: 截面极端值
-            pl.when(pl.col("delay_rank_pct") < 0.05)  # 最快5%
-              .then(1.5)
-              .when(pl.col("delay_rank_pct") > 0.95)  # 最慢5%
-              .then(-1.5)
-              .otherwise(0)
-              .alias("signal_cross_extreme"),
-            
-            # Signal 4: Delay + Length组合
-            # 当delay大且length也在减少时（公司可能有问题）
-            pl.when(
-                (pl.col("delay_z_recent") > 1.5) &
-                (pl.col("length_change") < 0)
-            ).then(-1.5)
-              .when(
-                (pl.col("delay_z_recent") < -1.5) &
-                (pl.col("length_change") > 0)
-            ).then(1.5)
-              .otherwise(0)
-              .alias("signal_delay_length"),
-            
-            # Signal 5: 综合加权
-            (
-                0.3 * pl.col("signal_extreme_delay").fill_null(0) +
-                0.3 * pl.col("signal_accelerating").fill_null(0) +
-                0.2 * pl.col("signal_cross_extreme").fill_null(0) +
-                0.2 * pl.col("signal_delay_length").fill_null(0)
-            ).alias("signal_composite"),
-        ])
-        
-        return df
-    
-    def create_quintile_portfolios(self, signal_col: str = "signal_composite") -> pl.DataFrame:
-        """
-        创建五分位组合（多空 + 中间组）
-        """
-        
-        df = self.generate_base_signals()
-        
-        # 每个日期分成5组
-        portfolios = df.with_columns([
-            pl.col(signal_col).qcut(5, labels=["Q1_Short", "Q2", "Q3", "Q4", "Q5_Long"])
-              .over("date")
-              .alias("quintile")
-        ])
-        
-        return portfolios
-    
-    def backtest_signal(self, 
-                       signal_col: str,
-                       returns_df: pl.DataFrame,
-                       holding_period: int = 20) -> dict:
-        """
-        简单回测框架
-        
-        Parameters:
-        -----------
-        signal_col : 要测试的信号列
-        returns_df : 包含 qid, date, forward_return_Nd 的收益数据
-        holding_period : 持有期（天）
-        """
-        
-        signals = self.generate_base_signals()
-        
-        # 合并收益数据
-        backtest_df = signals.join(
-            returns_df.select(["qid", "date", f"forward_return_{holding_period}d"]),
-            on=["qid", "date"],
-            how="inner"
+# signal_df: (sector_id, date, signal_value)  ← 你的原始数据
+# 注意：signal 必须 shift(1) 错位，避免前视偏差
+signal_shifted = signal_df.with_columns(
+    pl.col("signal_value").shift(1).over("sector_id")
+).drop_nulls()
+
+weights   = signal_to_weight(signal_shifted, method=METHOD)
+final_w   = apply_rebalance_buffer(weights, prev_weights)   # 首期 prev_weights 为空
+positions = weight_to_position(final_w, universe, price_df)
+trades    = generate_trades(prev_positions, positions)
+
+import polars as pl
+
+# ── 参数 ──────────────────────────────────────────────
+PORTFOLIO_NAV    = 1_000_000
+TOP_N            = None        # None = 全部 sector，int = 只取前 N
+WEIGHT_CAP       = 0.30        # 单 ETF 最大权重
+REBAL_THRESHOLD  = 0.02        # 换手触发阈值（相对权重变化）
+METHOD           = "zscore"    # "topn" | "zscore" | "rank_linear"
+
+# ── Step 1: 信号 → 截面权重 ───────────────────────────
+def signal_to_weight(signal_df: pl.DataFrame, method: str) -> pl.DataFrame:
+    df = signal_df.sort(["date", "sector_id"])
+
+    if method == "topn":
+        df = (
+            df.with_columns(
+                pl.col("signal_value")
+                  .rank("dense", descending=True)
+                  .over("date")
+                  .alias("rank")
+            )
+            .filter(pl.col("rank") <= TOP_N)
+            .with_columns((1.0 / pl.col("rank").count().over("date")).alias("raw_weight"))
         )
-        
-        # 计算每个日期的多空组合收益
-        portfolio_returns = backtest_df.with_columns([
-            # 排序
-            pl.col(signal_col).rank().over("date").alias("signal_rank"),
-            pl.col("qid").count().over("date").alias("n_stocks_date"),
-        ]).with_columns([
-            # Top 20% = Long, Bottom 20% = Short
-            pl.when(pl.col("signal_rank") > pl.col("n_stocks_date") * 0.8)
-              .then(pl.col(f"forward_return_{holding_period}d"))
-              .when(pl.col("signal_rank") <= pl.col("n_stocks_date") * 0.2)
-              .then(-pl.col(f"forward_return_{holding_period}d"))
-              .otherwise(None)
-              .alias("portfolio_return")
-        ]).filter(pl.col("portfolio_return").is_not_null())
-        
-        # 按日期汇总
-        daily_returns = portfolio_returns.group_by("date").agg([
-            pl.col("portfolio_return").mean().alias("daily_return")
-        ]).sort("date")
-        
-        # 计算统计指标
-        mean_return = daily_returns["daily_return"].mean()
-        std_return = daily_returns["daily_return"].std()
-        sharpe = mean_return / std_return * (252 ** 0.5)  # 年化
-        
-        return {
-            "sharpe": sharpe,
-            "mean_return": mean_return,
-            "std_return": std_return,
-            "n_periods": len(daily_returns)
-        }
+
+    elif method == "zscore":
+        df = (
+            df.with_columns([
+                pl.col("signal_value").mean().over("date").alias("mu"),
+                pl.col("signal_value").std().over("date").alias("sigma"),
+            ])
+            .with_columns(
+                ((pl.col("signal_value") - pl.col("mu")) / pl.col("sigma"))
+                .clip(lower_bound=0)   # long-only：截掉负 z
+                .alias("raw_weight")
+            )
+        )
+
+    elif method == "rank_linear":
+        df = (
+            df.with_columns(
+                pl.col("signal_value")
+                  .rank(descending=True)
+                  .over("date")
+                  .alias("raw_rank")
+            )
+            .with_columns(
+                (1.0 / pl.col("raw_rank")).alias("raw_weight")
+            )
+        )
+
+    # 归一化 → 权重上限 → 再归一化
+    df = (
+        df.with_columns(
+            (pl.col("raw_weight") / pl.col("raw_weight").sum().over("date"))
+            .alias("weight")
+        )
+        .with_columns(
+            pl.col("weight").clip(upper_bound=WEIGHT_CAP).alias("weight")
+        )
+        .with_columns(
+            (pl.col("weight") / pl.col("weight").sum().over("date"))
+            .alias("weight")
+        )
+    )
+    return df.select(["date", "sector_id", "weight"])
 
 
-# ============= 完整使用示例 =============
+# ── Step 2: 换手控制 ───────────────────────────────────
+def apply_rebalance_buffer(
+    target: pl.DataFrame,
+    current: pl.DataFrame,   # (date, sector_id, weight) 上期持仓
+) -> pl.DataFrame:
+    """
+    只有 |target_weight - current_weight| > threshold 时才真正调仓
+    """
+    df = (
+        target.join(
+            current.rename({"weight": "current_weight"}),
+            on=["date", "sector_id"],
+            how="left"
+        )
+        .with_columns(pl.col("current_weight").fill_null(0.0))
+        .with_columns(
+            (pl.col("weight") - pl.col("current_weight")).abs().alias("diff")
+        )
+        .with_columns(
+            pl.when(pl.col("diff") > REBAL_THRESHOLD)
+              .then(pl.col("weight"))
+              .otherwise(pl.col("current_weight"))
+              .alias("final_weight")
+        )
+        # 重新归一化（保证 long-only 总权重 = 1）
+        .with_columns(
+            (pl.col("final_weight") / pl.col("final_weight").sum().over("date"))
+            .alias("final_weight")
+        )
+    )
+    return df.select(["date", "sector_id", "final_weight"])
 
-# 1. 创建signal生成器
-signal_gen = FilingSignalV2(filing_df)
 
-# 2. 生成所有信号
-signals = signal_gen.generate_base_signals()
+# ── Step 3: 权重 → ETF 持仓（股数）───────────────────
+def weight_to_position(
+    weight_df: pl.DataFrame,   # (date, sector_id, final_weight)
+    universe:  pl.DataFrame,   # (sector_id, etf_ticker)
+    price_df:  pl.DataFrame,   # (etf_ticker, date, close)
+) -> pl.DataFrame:
+    return (
+        weight_df
+        .join(universe, on="sector_id", how="left")
+        .join(price_df, on=["etf_ticker", "date"], how="left")
+        .with_columns([
+            (pl.col("final_weight") * PORTFOLIO_NAV).alias("notional"),
+        ])
+        .with_columns(
+            (pl.col("notional") / pl.col("close")).floor().alias("shares")
+        )
+        # 实际持仓金额（取整后）
+        .with_columns(
+            (pl.col("shares") * pl.col("close")).alias("actual_notional")
+        )
+        .select([
+            "date", "sector_id", "etf_ticker",
+            "final_weight", "notional", "shares", "actual_notional", "close"
+        ])
+    )
 
-# 3. 测试不同信号
-test_signals = [
-    "signal_extreme_delay",
-    "signal_accelerating", 
-    "signal_cross_extreme",
-    "signal_delay_length",
-    "signal_composite"
-]
 
-print("Signal Performance:")
-print("-" * 60)
-for sig in test_signals:
-    stats = signal_gen.backtest_signal(sig, returns_df, holding_period=20)
-    print(f"{sig:30s} | Sharpe: {stats['sharpe']:.2f} | "
-          f"Mean: {stats['mean_return']*10000:.1f}bps | "
-          f"Std: {stats['std_return']*10000:.1f}bps")
-
-# 4. 创建最终组合
-final_portfolio = signal_gen.create_quintile_portfolios(signal_col="signal_composite")
+# ── Step 4: 生成交易指令（diff 前后持仓）────────────────
+def generate_trades(
+    prev_pos: pl.DataFrame,
+    curr_pos: pl.DataFrame,
+) -> pl.DataFrame:
+    return (
+        curr_pos.select(["date", "etf_ticker", "shares"])
+        .join(
+            prev_pos.select(["etf_ticker", "shares"]).rename({"shares": "prev_shares"}),
+            on="etf_ticker",
+            how="left"
+        )
+        .with_columns(pl.col("prev_shares").fill_null(0))
+        .with_columns(
+            (pl.col("shares") - pl.col("prev_shares")).alias("trade_shares")
+        )
+        .with_columns(
+            pl.when(pl.col("trade_shares") > 0).then(pl.lit("BUY"))
+             .when(pl.col("trade_shares") < 0).then(pl.lit("SELL"))
+             .otherwise(pl.lit("HOLD"))
+             .alias("side")
+        )
+        .filter(pl.col("trade_shares") != 0)
+    )
