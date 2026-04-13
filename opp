@@ -1,0 +1,705 @@
+"""
+Openwork Japanese Review Sentiment Signal Pipeline
+===================================================
+Input : polars DataFrame, one column per review dimension (Japanese text)
+Output: weekly/daily PIT-correct sentiment signals per (company, trading_date)
+
+Requirements:
+    pip install polars fugashi ipadic unidic-lite numpy pandas-market-calendars
+"""
+
+from __future__ import annotations
+
+import multiprocessing as mp
+import re
+from datetime import date, timedelta
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import polars as pl
+
+# ---------------------------------------------------------------------------
+# 0. Config
+# ---------------------------------------------------------------------------
+
+class PipelineConfig:
+    # ── columns ──────────────────────────────────────────────────────────────
+    COMPANY_COL    : str       = "company_id"
+    DATE_COL       : str       = "review_date"   # date the review was submitted
+    TEXT_COLUMNS   : list[str] = ["wlb", "long_term_development", "reason_to_quit"]
+
+    # ── lexicon ──────────────────────────────────────────────────────────────
+    LEXICON_PATH   : str       = "wago.121808.pn"   # 東工大極性辞書
+
+    # ── scoring ──────────────────────────────────────────────────────────────
+    MIN_COVERAGE   : float     = 0.05   # minimum lexicon hit rate to keep a review
+    MIN_MATCHED    : int       = 2      # minimum matched sentiment words
+    NEGATION_WINDOW: int       = 3      # how many tokens after target to look for negation
+
+    # ── signal construction ──────────────────────────────────────────────────
+    HALFLIFE_DAYS  : int       = 180    # exponential decay half-life (days)
+    MAX_STALE_DAYS : int       = 180    # null-out signal if no review for this many days
+    MIN_REVIEWS    : int       = 5      # min cumulative reviews before emitting signal
+    FREQUENCY      : str       = "week" # "week" (Friday) or "day"
+
+    # ── date range ───────────────────────────────────────────────────────────
+    START_DATE     : str       = "2010-01-01"
+    END_DATE       : str       = "2022-12-31"
+
+    # ── compute ──────────────────────────────────────────────────────────────
+    N_WORKERS      : int       = 4
+    CHUNK_SIZE     : int       = 2_000
+
+
+CFG = PipelineConfig()
+
+
+# ---------------------------------------------------------------------------
+# 1. Sentiment lexicon
+# ---------------------------------------------------------------------------
+
+#: Domain-specific supplement – overrides base lexicon where present
+DOMAIN_VOCAB: dict[str, float] = {
+    # WLB
+    "残業":        -0.8, "長時間労働":  -0.9, "サービス残業": -1.0,
+    "フレックス":   0.6, "有休":         0.5, "休暇":          0.4,
+    "激務":        -0.9, "裁量":         0.5, "テレワーク":    0.5,
+    "在宅":         0.4, "ワークライフ":  0.5, "定時":          0.4,
+    # キャリア・成長
+    "スキルアップ": 0.7, "成長":         0.6, "停滞":         -0.6,
+    "頭打ち":      -0.7, "スキル":       0.4, "研修":          0.4,
+    "昇進":         0.6, "昇格":         0.6, "育成":          0.5,
+    "キャリアパス": 0.5, "天井":        -0.5,
+    # 退職理由
+    "限界":        -0.8, "燃え尽き":    -0.9, "ハラスメント": -1.0,
+    "パワハラ":    -1.0, "セクハラ":    -1.0, "体調":         -0.5,
+    "ブラック":    -1.0, "転職":        -0.3,
+    # 組織・経営
+    "風通し":       0.6, "閉鎖的":      -0.7, "縦社会":       -0.5,
+    "派閥":        -0.6, "古い":        -0.3, "ビジョン":      0.5,
+    "リストラ":    -0.9, "不透明":      -0.6, "コンプライアンス": 0.3,
+    "改革":         0.4, "イノベーション": 0.6,
+    # 評価・給与
+    "評価制度":     0.3, "実力主義":     0.5, "年功序列":     -0.3,
+    "給与":         0.3, "ボーナス":     0.4, "低賃金":       -0.7,
+}
+
+#: Negation tokens that flip polarity of a preceding sentiment word
+NEGATION_WORDS: frozenset[str] = frozenset([
+    "ない", "なかった", "なく", "なければ", "ず", "ぬ",
+    "ません", "ませんでした", "まい", "ざる", "ぬ",
+])
+
+#: Hedging phrases (self-censorship indicator)
+HEDGE_PATTERNS: list[str] = [
+    "かもしれない", "ような気がする", "と思われる",
+    "一概には言えない", "人によっては", "場合もある",
+    "かもしれません", "でしょうか", "わからない",
+    "とも言える", "かどうか",
+]
+
+#: POS tags whose lemmas are scored
+TARGET_POS: frozenset[str] = frozenset([
+    "名詞", "動詞", "形容詞", "副詞", "形容動詞",
+])
+
+
+def load_lexicon(path: str) -> dict[str, float]:
+    """
+    Parse 東工大極性辞書.
+    Supported formats
+    -----------------
+    word TAB p/n/e
+    word TAB p/n/e TAB float_score
+    """
+    result: dict[str, float] = {}
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(
+            f"Lexicon not found: {path}\n"
+            "Download from https://www.cl.ecei.tohoku.ac.jp/resources/sent_lex/"
+        )
+    with open(p, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            word = parts[0]
+            if len(parts) >= 3:
+                try:
+                    score = float(parts[2])
+                except ValueError:
+                    label = parts[1]
+                    score = 1.0 if label == "p" else (-1.0 if label == "n" else 0.0)
+            else:
+                label = parts[1]
+                score = 1.0 if label == "p" else (-1.0 if label == "n" else 0.0)
+            result[word] = score
+
+    result.update(DOMAIN_VOCAB)   # domain vocab takes priority
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 2. Single-review scorer  (instantiated once per worker process)
+# ---------------------------------------------------------------------------
+
+class ReviewScorer:
+    """
+    Scores a single Japanese review string.
+    Not thread-safe (fugashi.Tagger is process-local).
+    Instantiate once per process via _worker_init().
+    """
+
+    def __init__(self, lexicon: dict[str, float]):
+        import fugashi
+        self.lexicon  = lexicon
+        self._tagger  = fugashi.Tagger()
+
+    # ------------------------------------------------------------------
+    def _tokenize(self, text: str) -> list[tuple[str, str]]:
+        """Return list of (lemma, pos1) for all tokens."""
+        out = []
+        for word in self._tagger(text):
+            try:
+                lemma = word.feature.lemma or str(word)
+                pos   = word.feature.pos1 or ""
+            except Exception:
+                lemma, pos = str(word), ""
+            out.append((lemma, pos))
+        return out
+
+    # ------------------------------------------------------------------
+    def score(self, text: Optional[str]) -> dict:
+        """Return scoring dict for one review string."""
+        _null = {
+            "sentiment_score": None,
+            "matched_words":   0,
+            "total_words":     0,
+            "coverage":        None,
+            "negation_count":  0,
+            "hedge_score":     0.0,
+        }
+        if not text or not isinstance(text, str) or not text.strip():
+            return _null
+
+        tokens        = self._tokenize(text)
+        content_tok   = [(w, p) for w, p in tokens if p in TARGET_POS]
+        scores        = []
+        negation_count = 0
+
+        for i, (lemma, pos) in enumerate(tokens):
+            if pos not in TARGET_POS:
+                continue
+            if lemma not in self.lexicon:
+                continue
+
+            polarity = self.lexicon[lemma]
+
+            # check for negation in the next NEGATION_WINDOW tokens
+            window = [w for w, _ in tokens[i + 1: i + 1 + CFG.NEGATION_WINDOW]]
+            if any(w in NEGATION_WORDS for w in window):
+                polarity       = -polarity
+                negation_count += 1
+
+            scores.append(polarity)
+
+        hedge_count = sum(text.count(p) for p in HEDGE_PATTERNS)
+        hedge_score = hedge_count / max(len(text) / 50.0, 1.0)
+
+        if not scores:
+            return {
+                **_null,
+                "total_words": len(content_tok),
+                "hedge_score": round(hedge_score, 4),
+            }
+
+        n_content = max(len(content_tok), 1)
+        return {
+            "sentiment_score": round(float(np.mean(scores)), 4),
+            "matched_words":   len(scores),
+            "total_words":     len(content_tok),
+            "coverage":        round(len(scores) / n_content, 4),
+            "negation_count":  negation_count,
+            "hedge_score":     round(hedge_score, 4),
+        }
+
+
+# ---------------------------------------------------------------------------
+# 3. Multi-process scoring  (Step 1 of pipeline)
+# ---------------------------------------------------------------------------
+
+# module-level globals used by worker processes
+_worker_lexicon: Optional[dict[str, float]] = None
+_worker_scorer:  Optional[ReviewScorer]     = None
+
+
+def _worker_init(lexicon_path: str) -> None:
+    global _worker_lexicon, _worker_scorer
+    _worker_lexicon = load_lexicon(lexicon_path)
+    _worker_scorer  = ReviewScorer(_worker_lexicon)
+
+
+def _score_chunk(texts: list[Optional[str]]) -> list[dict]:
+    return [_worker_scorer.score(t) for t in texts]  # type: ignore[union-attr]
+
+
+def score_dataframe(
+    df: pl.DataFrame,
+    text_columns: list[str] = CFG.TEXT_COLUMNS,
+    lexicon_path: str       = CFG.LEXICON_PATH,
+    n_workers:    int       = CFG.N_WORKERS,
+    chunk_size:   int       = CFG.CHUNK_SIZE,
+) -> pl.DataFrame:
+    """
+    Add sentiment score columns for every text column.
+
+    Added columns (per text column `c`):
+        {c}_sentiment_score   float | null
+        {c}_matched_words     int
+        {c}_total_words       int
+        {c}_coverage          float | null
+        {c}_negation_count    int
+        {c}_hedge_score       float
+    """
+    result = df.clone()
+
+    for col in text_columns:
+        print(f"  Scoring column '{col}' ({df.height:,} rows) …", flush=True)
+        texts  = df[col].to_list()
+        chunks = [texts[i: i + chunk_size] for i in range(0, len(texts), chunk_size)]
+
+        with mp.Pool(
+            processes  = n_workers,
+            initializer= _worker_init,
+            initargs   = (lexicon_path,),
+        ) as pool:
+            batches = pool.map(_score_chunk, chunks)
+
+        flat       = [item for batch in batches for item in batch]
+        scores_df  = pl.DataFrame(flat).rename(
+            {c: f"{col}_{c}" for c in flat[0]}
+        )
+        result = pl.concat([result, scores_df], how="horizontal")
+        n_scored = scores_df[f"{col}_sentiment_score"].drop_nulls().len()
+        print(f"    → {n_scored:,} reviews scored, "
+              f"{df.height - n_scored:,} null/skipped", flush=True)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 4. Quality filter  (Step 2)
+# ---------------------------------------------------------------------------
+
+def filter_low_quality(
+    df:           pl.DataFrame,
+    text_columns: list[str] = CFG.TEXT_COLUMNS,
+    min_coverage: float     = CFG.MIN_COVERAGE,
+    min_matched:  int       = CFG.MIN_MATCHED,
+) -> pl.DataFrame:
+    """
+    Per review-column, null-out the sentiment score when coverage is too low.
+    We null rather than drop rows (other columns may still be valid).
+    """
+    exprs = []
+    for col in text_columns:
+        sc  = f"{col}_sentiment_score"
+        cov = f"{col}_coverage"
+        mw  = f"{col}_matched_words"
+        exprs.append(
+            pl.when(
+                pl.col(cov).is_null()
+                | (pl.col(cov) < min_coverage)
+                | (pl.col(mw) < min_matched)
+            )
+            .then(None)
+            .otherwise(pl.col(sc))
+            .alias(sc)
+        )
+    return df.with_columns(exprs)
+
+
+# ---------------------------------------------------------------------------
+# 5. Irregular-time EWMA per company  (Step 3)
+# ---------------------------------------------------------------------------
+
+def _ewma_irregular(
+    values: np.ndarray,
+    dates:  list[date],
+    lambda_: float,
+) -> np.ndarray:
+    """
+    Compute exponentially weighted moving average for irregularly spaced
+    observations.  Alpha adapts to the actual time gap between reviews:
+
+        alpha_t = 1 - exp(-lambda * delta_t_days)
+
+    where lambda = ln(2) / halflife_days.
+    Returns array of same length; leading entries may be NaN.
+    """
+    n      = len(values)
+    result = np.full(n, np.nan)
+    ewma   = None
+    prev_d = None
+
+    for i in range(n):
+        v = values[i]
+        if np.isnan(v):
+            result[i] = ewma if ewma is not None else np.nan
+            continue
+
+        if ewma is None:
+            ewma      = v
+            prev_d    = dates[i]
+            result[i] = ewma
+            continue
+
+        dt     = (dates[i] - prev_d).days
+        alpha  = 1.0 - np.exp(-lambda_ * max(dt, 0))
+        ewma   = alpha * v + (1.0 - alpha) * ewma
+        prev_d = dates[i]
+        result[i] = ewma
+
+    return result
+
+
+def compute_ewma_signals(
+    df:           pl.DataFrame,
+    text_columns: list[str] = CFG.TEXT_COLUMNS,
+    company_col:  str       = CFG.COMPANY_COL,
+    date_col:     str       = CFG.DATE_COL,
+    halflife_days:int       = CFG.HALFLIFE_DAYS,
+) -> pl.DataFrame:
+    """
+    For each company, compute irregular-time EWMA of each score column.
+
+    Returns a DataFrame with columns:
+        company_col, date_col, {col}_ewma …, n_cumulative
+    """
+    lambda_    = np.log(2) / halflife_days
+    score_cols = [f"{c}_sentiment_score" for c in text_columns]
+
+    df_base = (
+        df
+        .select([company_col, date_col] + score_cols)
+        .with_columns(pl.col(date_col).cast(pl.Date))
+        .sort([company_col, date_col])
+    )
+
+    parts: list[pl.DataFrame] = []
+
+    for (company,), group in df_base.group_by([company_col], maintain_order=True):
+        group   = group.sort(date_col)
+        dates_l = group[date_col].to_list()
+        n       = group.height
+        row: dict = {
+            company_col:    [company] * n,
+            date_col:       dates_l,
+            "n_cumulative": list(range(1, n + 1)),
+        }
+        for sc in score_cols:
+            vals     = group[sc].fill_null(float("nan")).to_numpy().astype(float)
+            ewma_arr = _ewma_irregular(vals, dates_l, lambda_)
+            row[f"{sc}_ewma"] = ewma_arr.tolist()
+
+        parts.append(pl.DataFrame(row))
+
+    return pl.concat(parts).sort([company_col, date_col])
+
+
+# ---------------------------------------------------------------------------
+# 6. Trading calendar
+# ---------------------------------------------------------------------------
+
+def get_signal_dates(
+    start:     str = CFG.START_DATE,
+    end:       str = CFG.END_DATE,
+    frequency: str = CFG.FREQUENCY,
+    market:    str = "JPX",          # "JPX" or "NYSE"
+) -> pl.Series:
+    """
+    Return a pl.Series of signal dates (Date dtype).
+    Uses pandas_market_calendars when available; falls back to Mon-Fri.
+    """
+    try:
+        import pandas_market_calendars as mcal
+        cal      = mcal.get_calendar(market)
+        schedule = cal.schedule(start_date=start, end_date=end)
+        all_td   = pl.Series("d", schedule.index.date.tolist(), dtype=pl.Date)
+    except ImportError:
+        print("  [warn] pandas-market-calendars not installed, using Mon–Fri fallback")
+        rng    = pl.date_range(pl.date(*map(int, start.split("-"))),
+                               pl.date(*map(int, end.split("-"))),
+                               interval="1d", eager=True)
+        all_td = rng.filter(rng.dt.weekday() < 5)
+
+    if frequency == "week":
+        # keep Fridays (weekday == 4); if market closed on Friday take Thursday
+        fridays = all_td.filter(all_td.dt.weekday() == 4)
+        return fridays
+    return all_td
+
+
+# ---------------------------------------------------------------------------
+# 7. Expand to (company × signal_date) grid + forward-fill  (Step 4)
+# ---------------------------------------------------------------------------
+
+def expand_to_signal_grid(
+    ewma_df:       pl.DataFrame,
+    signal_dates:  pl.Series,
+    text_columns:  list[str] = CFG.TEXT_COLUMNS,
+    company_col:   str       = CFG.COMPANY_COL,
+    date_col:      str       = CFG.DATE_COL,
+    min_reviews:   int       = CFG.MIN_REVIEWS,
+    max_stale_days:int       = CFG.MAX_STALE_DAYS,
+) -> pl.DataFrame:
+    """
+    1. Build full (company × signal_date) grid.
+    2. Left-join EWMA events (only rows where a new review arrived).
+    3. Forward-fill EWMA values within each company.
+    4. Expire signals that are too stale (no new review for max_stale_days).
+    5. Drop rows before min_reviews cumulative reviews.
+    """
+    ewma_cols  = [f"{c}_sentiment_score_ewma" for c in text_columns]
+
+    # ── grid ────────────────────────────────────────────────────────────────
+    companies = ewma_df[company_col].unique()
+    grid = (
+        companies.to_frame()
+        .join(signal_dates.rename("signal_date").to_frame(), how="cross")
+    )
+
+    # ── join EWMA events onto grid ───────────────────────────────────────────
+    events = ewma_df.rename({date_col: "signal_date"})
+
+    merged = (
+        grid
+        .join(events, on=[company_col, "signal_date"], how="left")
+        .sort([company_col, "signal_date"])
+    )
+
+    # ── track last update date (needed for staleness check) ─────────────────
+    merged = merged.with_columns(
+        pl.when(pl.col("n_cumulative").is_not_null())
+          .then(pl.col("signal_date"))
+          .otherwise(None)
+          .alias("_last_update")
+    ).with_columns(
+        pl.col("_last_update").forward_fill().over(company_col)
+    )
+
+    # ── forward-fill EWMA and cumulative count ────────────────────────────────
+    fill_cols = ewma_cols + ["n_cumulative"]
+    merged = merged.with_columns(
+        [pl.col(c).forward_fill().over(company_col) for c in fill_cols]
+    )
+
+    # ── expire stale signals ─────────────────────────────────────────────────
+    stale_mask = (
+        (pl.col("signal_date") - pl.col("_last_update"))
+        .dt.total_days()
+        > max_stale_days
+    )
+    merged = merged.with_columns(
+        [pl.when(stale_mask).then(None).otherwise(pl.col(c)).alias(c)
+         for c in ewma_cols]
+    )
+
+    # ── apply min_reviews gate ────────────────────────────────────────────────
+    merged = merged.filter(
+        pl.col("n_cumulative").is_not_null()
+        & (pl.col("n_cumulative") >= min_reviews)
+    )
+
+    return merged.drop("_last_update").sort([company_col, "signal_date"])
+
+
+# ---------------------------------------------------------------------------
+# 8. Optional: cross-sectional z-score within sector
+# ---------------------------------------------------------------------------
+
+def add_sector_zscore(
+    signals:     pl.DataFrame,
+    text_columns:list[str] = CFG.TEXT_COLUMNS,
+    sector_col:  str       = "sector",
+    date_col:    str       = "signal_date",
+) -> pl.DataFrame:
+    """
+    Add sector-relative z-score for each EWMA signal.
+    Requires a 'sector' column in the signals DataFrame.
+    """
+    if sector_col not in signals.columns:
+        print(f"  [skip] '{sector_col}' column not found – skipping z-score")
+        return signals
+
+    ewma_cols = [f"{c}_sentiment_score_ewma" for c in text_columns]
+    exprs = []
+    for c in ewma_cols:
+        mu  = pl.col(c).mean().over([sector_col, date_col])
+        std = pl.col(c).std().over([sector_col, date_col])
+        exprs.append(
+            ((pl.col(c) - mu) / (std + 1e-8)).alias(f"{c}_zscore")
+        )
+    return signals.with_columns(exprs)
+
+
+# ---------------------------------------------------------------------------
+# 9. Master pipeline entry point
+# ---------------------------------------------------------------------------
+
+def run_pipeline(
+    df:           pl.DataFrame,
+    lexicon_path: str        = CFG.LEXICON_PATH,
+    text_columns: list[str]  = CFG.TEXT_COLUMNS,
+    company_col:  str        = CFG.COMPANY_COL,
+    date_col:     str        = CFG.DATE_COL,
+    frequency:    str        = CFG.FREQUENCY,
+    market:       str        = "JPX",
+    n_workers:    int        = CFG.N_WORKERS,
+    output_scored:str        = "openwork_scored.parquet",
+    output_signal:str        = "openwork_signals.parquet",
+) -> pl.DataFrame:
+    """
+    End-to-end pipeline.
+
+    Steps
+    -----
+    1. Score every review (multi-process lexicon scoring)
+    2. Filter low-quality reviews
+    3. Compute irregular-time EWMA per company
+    4. Expand to trading calendar + forward-fill
+    5. (optional) sector z-score
+
+    Returns the final signal DataFrame and writes both intermediate and
+    final outputs to parquet.
+    """
+
+    # ── Step 1: score ────────────────────────────────────────────────────────
+    print("=" * 60)
+    print("Step 1 / 4 — Scoring reviews")
+    print("=" * 60)
+    df_scored = score_dataframe(
+        df,
+        text_columns=text_columns,
+        lexicon_path=lexicon_path,
+        n_workers=n_workers,
+    )
+    df_scored.write_parquet(output_scored)
+    print(f"  Saved scored DataFrame → {output_scored}\n")
+
+    # ── Step 2: quality filter ───────────────────────────────────────────────
+    print("=" * 60)
+    print("Step 2 / 4 — Filtering low-quality reviews")
+    print("=" * 60)
+    df_clean = filter_low_quality(df_scored, text_columns=text_columns)
+    score_cols = [f"{c}_sentiment_score" for c in text_columns]
+    for sc in score_cols:
+        n_valid = df_clean[sc].drop_nulls().len()
+        print(f"  {sc}: {n_valid:,} valid / {df.height:,} total")
+    print()
+
+    # ── Step 3: EWMA per company ─────────────────────────────────────────────
+    print("=" * 60)
+    print("Step 3 / 4 — Computing irregular-time EWMA per company")
+    print("=" * 60)
+    ewma_df = compute_ewma_signals(
+        df_clean,
+        text_columns=text_columns,
+        company_col=company_col,
+        date_col=date_col,
+    )
+    n_companies = ewma_df[company_col].n_unique()
+    print(f"  {n_companies:,} companies processed\n")
+
+    # ── Step 4: expand to trading calendar ───────────────────────────────────
+    print("=" * 60)
+    print("Step 4 / 4 — Expanding to trading calendar + forward-fill")
+    print("=" * 60)
+    signal_dates = get_signal_dates(
+        start=CFG.START_DATE, end=CFG.END_DATE,
+        frequency=frequency, market=market,
+    )
+    print(f"  {len(signal_dates):,} signal dates ({frequency}) from "
+          f"{CFG.START_DATE} to {CFG.END_DATE}")
+
+    signals = expand_to_signal_grid(
+        ewma_df,
+        signal_dates=signal_dates,
+        text_columns=text_columns,
+        company_col=company_col,
+        date_col=date_col,
+    )
+
+    # optional: sector z-score
+    signals = add_sector_zscore(signals, text_columns=text_columns)
+
+    signals.write_parquet(output_signal)
+    print(f"\n  Final signal shape : {signals.shape}")
+    print(f"  Saved signals      → {output_signal}")
+    print()
+    print(signals.head(10))
+
+    return signals
+
+
+# ---------------------------------------------------------------------------
+# 10. Example usage
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+
+    # ── synthetic demo data (replace with real parquet load) ─────────────────
+    np.random.seed(42)
+    n = 600_000
+    rng_dates = pl.date_range(
+        pl.date(2008, 1, 1), pl.date(2022, 12, 31),
+        interval="1d", eager=True
+    )
+    sample_dates = rng_dates.sample(n, with_replacement=True).sort()
+
+    fake_reviews = [
+        "残業が多くて体調を崩した。ワークライフバランスは最悪です。",
+        "フレックスタイムが使えるので家族との時間が確保できます。",
+        "成長できる環境が整っており、スキルアップが見込めます。",
+        "将来性がなく、キャリアの天井を感じる。転職を考えています。",
+        "経営陣のビジョンが不透明で、方針が変わりすぎる。",
+        "風通しが良く、意見が通りやすい職場です。",
+        None,  # simulate missing data
+    ]
+
+    df_demo = pl.DataFrame({
+        "company_id":           [f"JP{i % 200:04d}" for i in range(n)],
+        "review_date":          sample_dates,
+        "sector":               [f"S{i % 10}" for i in range(n)],
+        "wlb":                  [fake_reviews[i % len(fake_reviews)] for i in range(n)],
+        "long_term_development":[fake_reviews[(i+2) % len(fake_reviews)] for i in range(n)],
+        "reason_to_quit":       [fake_reviews[(i+4) % len(fake_reviews)] for i in range(n)],
+    })
+
+    print(f"Demo DataFrame: {df_demo.shape}")
+    print(df_demo.head(3))
+    print()
+
+    # ── run ──────────────────────────────────────────────────────────────────
+    # For real usage:
+    # df = pl.read_parquet("openwork_raw.parquet")
+    # signals = run_pipeline(df)
+
+    # Demo: score a small subset to validate the pipeline without GPU
+    df_small = df_demo.head(5_000)
+
+    # Comment out the full pipeline and run just the scorer for a quick test:
+    print("Running scorer on 5,000 rows for validation …")
+
+    # Single-process quick test (no multiprocessing overhead)
+    lex = load_lexicon(CFG.LEXICON_PATH)
+    scorer = ReviewScorer(lex)
+    sample_scores = [scorer.score(t) for t in df_small["wlb"].to_list()]
+    non_null = sum(1 for s in sample_scores if s["sentiment_score"] is not None)
+    print(f"  Scored {non_null} / {len(sample_scores)} reviews (non-null)")
+    print(f"  Example: {sample_scores[0]}")
